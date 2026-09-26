@@ -286,7 +286,7 @@ class ContextService:
                 results.get("entities", []),
                 results.get("communities", []),
             )
-            context_str: str = orjson.dumps(context_data).decode()
+            context_str: str = orjson.dumps(context_data, default=str).decode()
         else:
             context_str = format_text(
                 results.get("episodes", []),
