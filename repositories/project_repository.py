@@ -10,10 +10,12 @@ from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import contains_eager
 
 from core.sorting import SortSpec, resolve_order_by
 from models.project import Project
 from models.project_member import ProjectMember
+from models.user import User
 
 PROJECT_SORTABLE_COLUMNS = {
     "name": Project.name,
@@ -25,6 +27,8 @@ PROJECT_SORTABLE_COLUMNS = {
 PROJECT_MEMBER_SORTABLE_COLUMNS = {
     "created_at": ProjectMember.created_at,
     "role": ProjectMember.role,
+    "name": User.name,
+    "email": User.email,
 }
 """Sortable columns for project members (default created_at/asc)."""
 
@@ -362,21 +366,29 @@ class ProjectRepository:
         self, project_id: UUID,
         sort: SortSpec | None = None,
     ) -> list[ProjectMember]:
-        """List all members of a project.
+        """List all members of a project with users eagerly loaded.
 
-        Default ``created_at/asc``; whitelist ``created_at``, ``role``.
+        Single query: LEFT OUTER JOIN to users (no ``is_deleted`` filter,
+        so soft-deleted users still resolve; ``member.user`` is ``None``
+        only when the user row is truly missing) with ``contains_eager``,
+        so accessing ``member.user`` emits no further SQL (no N+1).
+
+        Default ``created_at/asc``; whitelist ``created_at``, ``role``,
+        ``name``, ``email`` (user fields sort on the joined row).
 
         Args:
             project_id: The project's UUID.
             sort: Validated sort spec.
 
         Returns:
-            A list of ProjectMember ORM instances.
+            A list of ProjectMember ORM instances with ``user`` populated.
         """
         spec = sort if sort is not None else SortSpec()
         req_sort, req_dir = spec.effective("created_at", "asc")
         result = await self._db.execute(
             select(ProjectMember)
+            .outerjoin(User, ProjectMember.user_id == User.id)
+            .options(contains_eager(ProjectMember.user))
             .where(ProjectMember.project_id == project_id)
             .order_by(
                 *resolve_order_by(

@@ -21,6 +21,7 @@ from schemas.projects import (
     ProjectResponse,
     UpdateProjectRequest,
 )
+from schemas.users import UserResponse
 
 logger = logging.getLogger(__name__)
 
@@ -493,9 +494,18 @@ class ProjectService:
         project_id: UUID,
         sort: SortSpec | None = None,
     ) -> list[ProjectMemberResponse]:
-        """List all members of a project.
+        """List all members of a project with nested user details.
 
-        Default ``created_at/asc``; whitelist ``created_at``, ``role``.
+        Default ``created_at/asc``; whitelist ``created_at``, ``role``,
+        ``name``, ``email``.
+
+        Args:
+            project_id: The project's UUID.
+            sort: Validated sort spec (forwarded opaque to the repository).
+
+        Returns:
+            Memberships with ``user`` populated, or ``None`` when the
+            user row is missing.
         """
         members = await self._repo.list_members(project_id, sort=sort)
         return [
@@ -505,6 +515,9 @@ class ProjectService:
                 user_id=m.user_id,
                 role=m.role,
                 created_at=m.created_at,
+                user=UserResponse.model_validate(m.user)
+                if m.user is not None
+                else None,
             )
             for m in members
         ]

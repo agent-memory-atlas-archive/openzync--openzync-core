@@ -17,9 +17,10 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from models.base import Base, TimestampMixin
+from models.user import User
 
 
 class ProjectMember(TimestampMixin, Base):
@@ -54,6 +55,13 @@ class ProjectMember(TimestampMixin, Base):
         nullable=False,
         default="member",
         server_default="member",
+    )
+    user: Mapped[User | None] = relationship(
+        lazy="raise",
+        # note: read-only eager target for list_members' LEFT JOIN
+        # (contains_eager). ``raise`` fails loud on accidental lazy load
+        # in async context instead of raising MissingGreenlet at runtime.
+        # No is_deleted filter here — soft-deleted users still resolve.
     )
 
     __table_args__ = (
