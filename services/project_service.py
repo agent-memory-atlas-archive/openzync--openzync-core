@@ -8,6 +8,7 @@ for tenant isolation.
 from __future__ import annotations
 
 import logging
+from typing import Any
 from uuid import UUID
 
 from core.exceptions import NotFoundError, ValidationError
@@ -515,12 +516,35 @@ class ProjectService:
                 user_id=m.user_id,
                 role=m.role,
                 created_at=m.created_at,
-                user=UserResponse.model_validate(m.user)
-                if m.user is not None
-                else None,
+                user=self._to_user_response(m.user) if m.user is not None else None,
             )
             for m in members
         ]
+
+    @staticmethod
+    def _to_user_response(user: Any) -> UserResponse:
+        """Map a User ORM row to UserResponse without touching ``User.metadata``.
+
+        ``metadata`` is reserved on ``DeclarativeBase`` — the real column
+        lives on ``metadata_`` — so ``model_validate(orm)`` reads
+        ``MetaData()`` and 500s. Mirrors ``UserService._user_to_dict``.
+        """
+        return UserResponse.model_validate(
+            {
+                "id": user.id,
+                "organization_id": user.organization_id,
+                "external_id": user.external_id,
+                "name": user.name,
+                "email": user.email,
+                "metadata": dict(user.metadata_) if user.metadata_ else {},
+                "role": user.role,
+                "permissions": list(user.permissions or []),
+                "is_deleted": user.is_deleted,
+                "is_pending_invite": user.invite_token_hash is not None,
+                "created_at": user.created_at,
+                "updated_at": user.updated_at,
+            }
+        )
 
     async def update_member_role(
         self,
