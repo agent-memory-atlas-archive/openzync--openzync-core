@@ -183,6 +183,13 @@ filterwarnings = [
     # httpx.AsyncClient) may leave transports unclosed after the event
     # loop shuts down.  This is cosmetic — no data loss or leak.
     "ignore::pytest.PytestUnraisableExceptionWarning",
+    # SQLAlchemy >=2.1 warns when a Computed column omits `persisted=`, because
+    # PG18+ would render VIRTUAL where <18 renders STORED. models/llm_usage.py
+    # now sets persisted=True explicitly, but migrations 0001/0004 also declare
+    # this column and must not be edited, so Alembic still emits the warning
+    # from the historical migration files. The DDL is already correct (every
+    # supported PG is <18, so it is STORED); only the emission is noisy.
+    "ignore:^Computed column:sqlalchemy.exc.SAWarning",
 ]
 markers = [
     "unit: Unit tests — no I/O, no DB, no network. Mock at the service boundary.",

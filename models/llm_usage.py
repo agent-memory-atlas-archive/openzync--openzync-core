@@ -76,7 +76,11 @@ class LLMUsage(CreatedAtMixin, Base):
     )
     total_tokens: Mapped[int] = mapped_column(
         Integer,
-        Computed("prompt_tokens + completion_tokens"),
+        # persisted=True is explicit, not decorative: without it PostgreSQL 18+
+        # renders VIRTUAL instead of STORED, which would silently change the
+        # column from stored to recomputed. Matches the DDL in migrations
+        # 0001/0004, which create this column STORED on every current PG.
+        Computed("prompt_tokens + completion_tokens", persisted=True),
         nullable=False,
     )
     cost_estimate: Mapped[Decimal] = mapped_column(

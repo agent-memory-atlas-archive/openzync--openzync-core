@@ -6,6 +6,15 @@
 #   test-unit       → pytest with coverage
 #   test-integration → combined unit + integration coverage (Postgres + Redis + FalkorDB)
 # Tag builds/deploys live in cd.yml.
+#
+# Dependency source of truth: requirements.txt is the frozen lockfile and is
+# what every job installs. Do NOT use `pip install -e ".[dev]"` here — pyproject
+# declares lower bounds only, so CI would resolve a different tree than the
+# frozen one and fail on version drift that is impossible to reproduce locally
+# (already bit us twice: SQLAlchemy 2.1's psycopg2→psycopg3 default dialect
+# flip, and its new Computed-column SAWarning tripping `filterwarnings=error`).
+# `--no-deps` on the editable install keeps the lockfile authoritative while
+# still exposing `importlib.metadata.version("openzync")` to core/_version.py.
 # ──────────────────────────────────────────────────────────────────────────────
 
 name: CI
@@ -58,7 +67,7 @@ jobs:
           filters: |
             py_changed:
               - '**/*.py'
-      - run: pip install ruff mypy
+      - run: pip install -r requirements.txt
       - if: steps.filter.outputs.py_changed == 'true'
         run: |
           files=( ${{ steps.filter.outputs.py_changed_files }} )
@@ -84,7 +93,7 @@ jobs:
             ruff format --check "${existing[@]}"
           fi
       - if: steps.filter.outputs.py_changed == 'true'
-        run: pip install -e ".[dev]" && mypy core/ middleware/ dependencies/ routers/ models/ schemas/ services/
+        run: mypy core/ middleware/ dependencies/ routers/ models/ schemas/ services/
 
   # ═════════════════════════════════════════════════════════════════════════════
   # UNIT TESTS
@@ -97,7 +106,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - run: pip install -e ".[dev]"
+      - run: pip install -r requirements.txt && pip install -e . --no-deps
       - run: pytest tests/unit/ -v --timeout=30 --cov=core --cov=routers --cov=services --cov=repositories --cov=middleware --cov=dependencies --cov=workers --cov=packages --cov=schemas --cov=utils --cov-report=term --cov-report=xml --cov-fail-under=74
       - uses: codecov/codecov-action@v4
         with:
@@ -153,7 +162,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client
           PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE DATABASE test;" || true
-      - run: pip install -e ".[dev]"
+      - run: pip install -r requirements.txt && pip install -e . --no-deps
       - run: alembic upgrade head
       - run: |
           pytest tests/unit/ tests/integration/ -v --timeout=60 \
