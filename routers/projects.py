@@ -79,6 +79,7 @@ async def list_projects(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     pinned_only: bool = Query(default=False),
+    include_archived: bool = Query(default=False),
     sort_by: ProjectSortBy | None = Query(
         default=None,
         description="Sort key (default created_at, pinned_at for pinned_only).",
@@ -90,11 +91,12 @@ async def list_projects(
     _: None = Depends(require_permission("project:read")),
     service: ProjectService = Depends(_get_project_service),
 ) -> list[ProjectResponse]:
-    """List non-archived projects in the organisation.
+    """List projects in the organisation (archived excluded by default).
 
     For JWT-authenticated dashboard users, returns only projects the user
     is a member of.  For API-key-authenticated SDK requests, returns all
-    non-archived projects in the org.
+    projects in the org.  Pass ``include_archived=True`` to include
+    archived projects.  ``pinned_only`` always excludes archived projects.
     """
     raw_user_id: str | None = getattr(request.state, "user_id", None)
     auth_type: str | None = getattr(request.state, "auth_type", None)
@@ -112,6 +114,7 @@ async def list_projects(
         limit=limit,
         offset=offset,
         pinned_only=pinned_only,
+        include_archived=include_archived,
         sort=SortSpec(sort_by=sort_by, sort_dir=sort_dir),
     )
 
@@ -197,6 +200,31 @@ async def archive_project(
         project_id=project_id,
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/{project_id}/unarchive",
+    response_model=ProjectResponse,
+    dependencies=[
+        Depends(require_permission("project:manage")),
+    ],
+)
+@audit_action("project.unarchive", "project", "Project unarchived")
+async def unarchive_project(
+    project_id: UUID = Path(...),
+    request: Request = None,
+    service: ProjectService = Depends(_get_project_service),
+) -> ProjectResponse:
+    """Restore an archived project.
+
+    Requires ``project:manage``.  Unlike archive, no project-membership
+    check — ``require_project_membership`` 404s archived projects via
+    ``get_by_id``, which would make archived projects unrestorable.
+    """
+    return await service.unarchive_project(
+        organization_id=request.state.org_id,
+        project_id=project_id,
+    )
 
 
 # ── Pins ────────────────────────────────────────────────────────────────────

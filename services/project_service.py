@@ -154,15 +154,21 @@ class ProjectService:
         offset: int = 0,
         pinned_only: bool = False,
         sort: SortSpec | None = None,
+        include_archived: bool = False,
     ) -> list[ProjectResponse]:
-        """List non-archived projects in an organisation.
+        """List projects in an organisation.
 
         When ``user_id`` is provided, only projects where the user is a
         member are returned.  When ``user_id`` is ``None`` (API key auth),
-        all non-archived projects in the org are returned with
+        all projects in the org are returned with
         ``is_pinned=False``.  Each entry carries ``is_pinned`` for the
         requesting user; ``pinned_only=True`` returns just their pins,
         most recently pinned first.
+
+        Archived projects are excluded by default; pass
+        ``include_archived=True`` to include them.  The ``pinned_only``
+        branch always excludes archived projects — archiving deletes a
+        project's pins, so no archived project can be pinned.
 
         Default ``created_at/desc`` (``pinned_at/desc`` for pinned_only);
         whitelist ``name``, ``created_at``, ``updated_at`` (plus
@@ -176,6 +182,7 @@ class ProjectService:
             offset: Number of results to skip.
             pinned_only: Return only the user's pinned projects.
             sort: Validated sort spec (forwarded opaque to the repository).
+            include_archived: If ``True``, include archived projects.
 
         Raises:
             ValidationError: If ``pinned_only`` is set without a user
@@ -221,6 +228,7 @@ class ProjectService:
             limit=limit,
             offset=offset,
             sort=sort,
+            include_archived=include_archived,
         )
         # Batch-load member counts for all projects in a single query
         project_ids = [p.id for p in projects]
@@ -233,6 +241,7 @@ class ProjectService:
                 created_by=p.created_by,
                 member_count=counts.get(p.id, 0),
                 is_pinned=(p.id in pinned_ids),
+                is_archived=p.is_archived,
                 created_at=p.created_at,
                 updated_at=p.updated_at,
             )
@@ -315,6 +324,53 @@ class ProjectService:
                 "project_id": str(project_id),
                 "pins_removed": freed,
             },
+        )
+
+    async def unarchive_project(
+        self,
+        organization_id: UUID,
+        project_id: UUID,
+    ) -> ProjectResponse:
+        """Restore an archived project.
+
+        The repository fetches via a direct select including archived
+        rows — ``get_by_id`` 404s archived projects so it cannot be
+        used here.
+
+        Args:
+            organization_id: Tenant scope.
+            project_id: The project to restore.
+
+        Returns:
+            The restored ProjectResponse.
+
+        Raises:
+            NotFoundError: If the project does not exist.
+        """
+        project = await self._repo.unarchive(organization_id, project_id)
+        if project is None:
+            raise NotFoundError(
+                message=f"Project {project_id} not found",
+                detail={"project_id": str(project_id)},
+            )
+
+        member_count = await self._repo.count_members(project_id)
+        logger.info(
+            "project_service.project_unarchived",
+            extra={
+                "org_id": str(organization_id),
+                "project_id": str(project_id),
+            },
+        )
+        return ProjectResponse(
+            id=project.id,
+            name=project.name,
+            description=project.description or "",
+            created_by=project.created_by,
+            member_count=member_count,
+            is_archived=project.is_archived,
+            created_at=project.created_at,
+            updated_at=project.updated_at,
         )
 
     # ── Pins ──────────────────────────────────────────────────────────────────

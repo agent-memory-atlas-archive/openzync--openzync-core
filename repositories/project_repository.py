@@ -159,12 +159,16 @@ class ProjectRepository:
         limit: int = 50,
         offset: int = 0,
         sort: SortSpec | None = None,
+        include_archived: bool = False,
     ) -> list[Project]:
-        """List non-archived projects in an organisation.
+        """List projects in an organisation.
 
         When ``user_id`` is provided, only projects where that user is a
         member are returned.  When ``user_id`` is ``None`` (API key auth),
-        all non-archived projects in the org are returned.
+        all projects in the org are returned.
+
+        Archived projects are excluded by default; pass
+        ``include_archived=True`` to include them.
 
         Default ``created_at/desc``; whitelist ``name``, ``created_at``,
         ``updated_at``.
@@ -176,6 +180,7 @@ class ProjectRepository:
             limit: Maximum results per page (capped at 200).
             offset: Number of results to skip.
             sort: Validated sort spec.
+            include_archived: If ``True``, include archived projects.
 
         Returns:
             A list of Project ORM instances.
@@ -186,8 +191,9 @@ class ProjectRepository:
 
         query = select(Project).where(
             Project.organization_id == organization_id,
-            Project.is_archived.is_(False),
         )
+        if not include_archived:
+            query = query.where(Project.is_archived.is_(False))
 
         if user_id is not None:
             query = (
@@ -264,6 +270,36 @@ class ProjectRepository:
             return None
 
         project.is_archived = True
+        await self._db.flush()
+        await self._db.refresh(project)
+        return project
+
+    async def unarchive(
+        self, organization_id: UUID, project_id: UUID
+    ) -> Project | None:
+        """Restore an archived project (set ``is_archived=False``).
+
+        Uses a direct select including archived rows — ``get_by_id``
+        404s archived projects so it cannot be used here.
+
+        Args:
+            organization_id: Tenant scope.
+            project_id: The project's UUID.
+
+        Returns:
+            The unarchived Project, or ``None`` if not found.
+        """
+        result = await self._db.execute(
+            select(Project).where(
+                Project.id == project_id,
+                Project.organization_id == organization_id,
+            )
+        )
+        project = result.scalar_one_or_none()
+        if project is None:
+            return None
+
+        project.is_archived = False
         await self._db.flush()
         await self._db.refresh(project)
         return project
