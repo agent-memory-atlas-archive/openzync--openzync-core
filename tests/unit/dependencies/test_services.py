@@ -356,6 +356,7 @@ class TestGetMemoryService:
             "FactRepository": MagicMock(),
             "OrganizationRepository": MagicMock(),
             "EpisodeBlobRepository": MagicMock(),
+            "ProjectRepository": MagicMock(),
         }
 
         with (
@@ -365,14 +366,16 @@ class TestGetMemoryService:
             patch("dependencies.services.FactRepository") as m4,
             patch("dependencies.services.OrganizationRepository") as m5,
             patch("dependencies.services.EpisodeBlobRepository") as m6,
+            patch("dependencies.services.ProjectRepository") as m7,
             patch("dependencies.services.MemoryService") as mock_svc_cls,
         ):
-            for m in (m1, m2, m3, m4, m5, m6):
+            for m in (m1, m2, m3, m4, m5, m6, m7):
                 m.return_value = MagicMock()
             mock_svc_cls.return_value = "memory_service"
 
             result = await get_memory_service(request, db, webhook)
 
+            m7.assert_called_once_with(db)
             mock_svc_cls.assert_called_once_with(
                 db=db,
                 redis_client=request.app.state.redis,
@@ -383,6 +386,7 @@ class TestGetMemoryService:
                 org_repo=m5.return_value,
                 webhook_service=webhook,
                 blob_repo=m6.return_value,
+                project_repo=m7.return_value,
                 bao_client=request.app.state.openbao_client,
             )
             assert result == "memory_service"
@@ -438,22 +442,27 @@ class TestGetGraphService:
         with (
             patch("dependencies.services.UserRepository") as mock_user_repo_cls,
             patch("dependencies.services.FactRepository") as mock_fact_repo_cls,
+            patch("dependencies.services.EpisodeRepository") as mock_episode_repo_cls,
             patch("dependencies.services.GraphService") as mock_svc_cls,
         ):
             mock_user_repo = MagicMock()
             mock_user_repo_cls.return_value = mock_user_repo
             mock_fact_repo = MagicMock()
             mock_fact_repo_cls.return_value = mock_fact_repo
+            mock_episode_repo = MagicMock()
+            mock_episode_repo_cls.return_value = mock_episode_repo
             mock_svc_cls.return_value = "graph_service"
 
             result = await get_graph_service(request, mock_org_config, db, webhook)
 
             mock_dispatcher.resolve_and_create.assert_called_once()
+            mock_episode_repo_cls.assert_called_once_with(db)
             mock_svc_cls.assert_called_once_with(
                 graph_backend=mock_dispatcher.resolve_and_create.return_value,
                 user_repo=mock_user_repo,
                 fact_repo=mock_fact_repo,
                 webhook_service=webhook,
+                episode_repo=mock_episode_repo,
             )
             assert result == "graph_service"
 

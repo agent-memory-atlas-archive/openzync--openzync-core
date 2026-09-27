@@ -595,7 +595,7 @@ class TestFalkorGraphBackendRelationships:
         backend: FalkorGraphBackend,
         mock_graph: AsyncMock,
     ) -> None:
-        """New relationship creates via MERGE."""
+        """New relationship: endpoints MATCHed, only the edge MERGEd."""
         result_row = make_relationship_row(
             source_id=ENTITY_ID,
             target_id=TARGET_ID,
@@ -612,8 +612,14 @@ class TestFalkorGraphBackendRelationships:
         )
 
         query = mock_graph.query.call_args[0][0]
-        assert "MERGE (s:Entity" in query
-        assert "-[r:likes]->" in query
+        # MATCH-first: FalkorDB does not bind existing endpoints for a
+        # MERGEd node pattern, so MERGEing :Entity nodes would create bare
+        # duplicate "ghost" nodes carrying only id. The endpoints must stay
+        # a MATCH and the MERGE must cover the edge alone.
+        assert "MATCH (s:Entity {id: $source_id}), (t:Entity {id: $target_id})" in query
+        assert "MERGE (s:Entity" not in query
+        assert "MERGE (t:Entity" not in query
+        assert "MERGE (s)-[r:likes]->(t)" in query
         assert result["source_id"] == str(ENTITY_ID)
         assert result["target_id"] == str(TARGET_ID)
         assert result["type"] == "likes"

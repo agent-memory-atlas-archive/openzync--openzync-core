@@ -51,14 +51,34 @@ class TestProjectService:
         project.updated_at = kwargs.get("updated_at", datetime.now(UTC))
         return project
 
+    def _make_mock_user(self, **kwargs: object) -> MagicMock:
+        """Mock a User ORM row — every field UserResponse requires."""
+        user = MagicMock()
+        user.id = kwargs.get("id", self.USER_ID)
+        user.organization_id = kwargs.get("org_id", self.ORG_ID)
+        user.external_id = kwargs.get("external_id", "ext-user")
+        user.name = kwargs.get("name", "Test User")
+        user.email = kwargs.get("email", "test@example.com")
+        user.metadata_ = kwargs.get("metadata_", {})
+        user.role = kwargs.get("role", "member")
+        user.permissions = kwargs.get("permissions", [])
+        user.is_deleted = kwargs.get("is_deleted", False)
+        user.invite_token_hash = kwargs.get("invite_token_hash")
+        user.created_at = kwargs.get("created_at", datetime.now(UTC))
+        user.updated_at = kwargs.get("updated_at", datetime.now(UTC))
+        return user
+
     def _make_mock_member(self, **kwargs: object) -> MagicMock:
-        """Mock a ProjectMember ORM instance."""
+        """Mock a ProjectMember ORM instance (eager-loaded ``user``)."""
         member = MagicMock()
         member.id = kwargs.get("id", uuid4())
         member.project_id = kwargs.get("project_id", self.PROJECT_ID)
         member.user_id = kwargs.get("user_id", self.USER_ID)
         member.role = kwargs.get("role", "owner")
         member.created_at = kwargs.get("created_at", datetime.now(UTC))
+        # list_members serialises member.user into a nested UserResponse —
+        # an unstubbed MagicMock attribute fails validation there.
+        member.user = kwargs.get("user", self._make_mock_user(id=member.user_id))
         return member
 
     # ── Create ───────────────────────────────────────────────────────────────
@@ -160,6 +180,7 @@ class TestProjectService:
             limit=10,
             offset=0,
             sort=None,
+            include_archived=False,
         )
 
     @pytest.mark.asyncio
@@ -194,6 +215,7 @@ class TestProjectService:
             limit=50,
             offset=0,
             sort=spec,
+            include_archived=False,
         )
 
     # ── Update ───────────────────────────────────────────────────────────────
@@ -405,17 +427,29 @@ class TestProjectService:
 
     @pytest.mark.asyncio
     async def test_list_members_returns_members(self) -> None:
-        """Listing members returns all members."""
+        """Listing members returns all members with the nested user object."""
         service, mock_repo, _ = self._make_service()
+        second_user = uuid4()
         mock_repo.list_members.return_value = [
             self._make_mock_member(role="owner"),
-            self._make_mock_member(role="member", user_id=uuid4()),
+            self._make_mock_member(
+                role="member",
+                user_id=second_user,
+                user=self._make_mock_user(
+                    id=second_user, name="Second User", email="second@example.com"
+                ),
+            ),
         ]
 
         results = await service.list_members(project_id=self.PROJECT_ID)
         assert len(results) == 2
         assert results[0].role == "owner"
         assert results[1].role == "member"
+        # Nested user payload is populated (76fddf8).
+        assert results[1].user is not None
+        assert results[1].user.id == second_user
+        assert results[1].user.name == "Second User"
+        assert results[1].user.email == "second@example.com"
 
     # ── Update Member Role ───────────────────────────────────────────────────
 

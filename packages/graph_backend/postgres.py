@@ -1632,6 +1632,91 @@ class PostgresGraphBackend(GraphBackend):
                 },
             ) from exc
 
+    async def get_entities_for_episodes(
+        self,
+        org_id: UUID,
+        project_id: UUID,
+        episode_ids: list[UUID],
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return distinct graph entities linked to the given episodes.
+
+        Same return shape as :meth:`get_entities_for_session` — a list of
+        entity dicts with ``id``, ``name``, ``entity_type``, ``summary``
+        keys, capped at ``limit`` entries.
+
+        Joins the PG link tables directly by episode, mirroring
+        :meth:`get_entities_for_user` minus the user/session join.  The
+        caller resolves ``episode_ids`` (e.g. from the episodes table)
+        because session linkage lives outside the graph.  An empty
+        ``episode_ids`` list returns ``[]`` without touching the backend.
+
+        Args:
+            org_id: Organisational scope.
+            project_id: Project scope.
+            episode_ids: Episode UUIDs to scope the lookup to.
+            limit: Maximum entities to return (default 200, max 200).
+
+        Returns:
+            List of entity dicts with ``id``, ``name``, ``entity_type``,
+            ``summary`` keys.
+
+        Raises:
+            ExternalServiceError: If the lookup query fails.
+        """
+        if not episode_ids:
+            return []
+        limit = max(1, min(int(limit), 200))
+        try:
+            result = await self._db.execute(
+                text("""
+                    SELECT DISTINCT ge.id, ge.name, ge.entity_type, ge.summary
+                    FROM graph_entities ge
+                    JOIN graph_episode_entities gee ON ge.id = gee.entity_id
+                    JOIN episodes e ON e.id = gee.episode_id
+                    WHERE e.organization_id = :org_id
+                      AND ge.organization_id = :org_id
+                      AND ge.project_id = :project_id
+                      AND gee.episode_id IN :episode_ids
+                      AND e.is_deleted = false
+                      AND ge.is_merged = false
+                    LIMIT :limit
+                """).bindparams(bindparam("episode_ids", expanding=True)),
+                {
+                    "org_id": org_id,
+                    "project_id": project_id,
+                    "episode_ids": [str(e) for e in episode_ids],
+                    "limit": limit,
+                },
+            )
+            return [
+                {
+                    "id": str(row.id),
+                    "name": row.name,
+                    "entity_type": row.entity_type,
+                    "summary": row.summary if row.summary else "",
+                }
+                for row in result.all()
+            ]
+        except Exception as exc:
+            logger.error(
+                "pg_graph.get_entities_for_episodes_failed",
+                extra={
+                    "org_id": str(org_id),
+                    "project_id": str(project_id),
+                    "episode_count": len(episode_ids),
+                    "error": str(exc),
+                },
+            )
+            raise ExternalServiceError(
+                message=f"Failed to get entities for episodes: {exc}",
+                detail={
+                    "org_id": str(org_id),
+                    "episode_count": len(episode_ids),
+                },
+            ) from exc
+
     async def get_co_occurring_entity_pairs(
         self,
         org_id: UUID,

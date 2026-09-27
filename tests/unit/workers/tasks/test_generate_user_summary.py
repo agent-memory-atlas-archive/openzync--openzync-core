@@ -10,6 +10,12 @@ _ORG_ID = str(uuid4())
 _USER_ID = str(uuid4())
 _PROJECT_ID = str(uuid4())
 
+# ``generate_user_summary`` resolves the graph backend before rendering and
+# raises ``GraphBackendUnavailableError`` when it comes back None, so every
+# test needs a non-None backend in the worker context.
+_GRAPH_BACKEND_TARGET = "workers.backend.resolve_graph_backend"
+_GRAPH_BACKEND = MagicMock()
+
 
 @pytest.mark.unit
 class TestGenerateUserSummary:
@@ -40,6 +46,7 @@ class TestGenerateUserSummary:
 
         with (
             patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
             patch("workers.tasks.generate_user_summary.render_prompt", return_value="Summarize this user."),
             patch("core.llm.resolve_backend", return_value=mock_llm),
             patch("core.org_config.get_org_config") as mock_cfg,
@@ -73,6 +80,7 @@ class TestGenerateUserSummary:
 
         with (
             patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
             patch("workers.tasks.generate_user_summary.render_prompt", return_value="No history."),
             patch("core.llm.resolve_backend", return_value=mock_llm),
             patch("core.org_config.get_org_config"),
@@ -97,6 +105,7 @@ class TestGenerateUserSummary:
         """LLM failure → graceful degradation (exception propagates for retry)."""
         with (
             patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
             patch("workers.tasks.generate_user_summary.render_prompt", return_value="Prompt."),
             patch("core.llm.resolve_backend", side_effect=Exception("LLM timeout")),
             patch("core.org_config.get_org_config"),
@@ -116,6 +125,7 @@ class TestGenerateUserSummary:
         """Prompt rendering failure propagates."""
         with (
             patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
             patch("workers.tasks.generate_user_summary.render_prompt", side_effect=Exception("Template error")),
         ):
             from workers.tasks.generate_user_summary import generate_user_summary
@@ -135,6 +145,7 @@ class TestGenerateUserSummary:
 
         with (
             patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
             patch("workers.tasks.generate_user_summary.render_prompt", return_value="Prompt."),
             patch("core.llm.resolve_backend", return_value=mock_llm),
             patch("core.org_config.get_org_config"),
@@ -162,6 +173,7 @@ class TestGenerateUserSummary:
 
         with (
             patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
             patch("workers.tasks.generate_user_summary.render_prompt", return_value="Prompt."),
             patch("core.llm.resolve_backend", return_value=mock_llm),
             patch("core.org_config.get_org_config", side_effect=Exception("Config fetch failed")),

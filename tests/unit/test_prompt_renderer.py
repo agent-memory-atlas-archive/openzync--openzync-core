@@ -12,6 +12,7 @@ Tests cover:
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -1292,13 +1293,21 @@ class TestProviderFetchUserEntities:
 
     @pytest.mark.asyncio
     async def test_no_user_id(self, org_id: UUID) -> None:
-        """Returns empty list."""
+        """Returns empty list without reaching for the graph backend."""
+        graph_backend = AsyncMock()
+
         result = await _fetch_user_entities(
             db=FakeAsyncSession(),
             org_id=org_id,
             user_id=None,
+            graph_backend=graph_backend,
+            project_id=None,
         )
         assert result == {"entities": []}
+        # The user_id guard runs before the backend guard
+        # (services/worker/prompt_renderer.py:723) — a missing user never
+        # reaches the graph, and never fails on a missing backend.
+        graph_backend.get_entities_for_user.assert_not_awaited()
 
 
 @pytest.mark.unit

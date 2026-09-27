@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -116,16 +117,27 @@ class TestGraphService:
 
     @pytest.mark.asyncio
     async def test_get_entities_with_session_id(self) -> None:
-        """When session_id is provided, uses get_entities_for_session."""
+        """session_id resolves episodes in Postgres, then queries the graph."""
         entity_id = uuid4()
+        episode_id = uuid4()
+        mock_episode_repo = AsyncMock()
+        mock_episode_repo.get_by_session_id.return_value = (
+            [SimpleNamespace(id=episode_id)],
+            None,
+        )
         mock_backend = AsyncMock()
-        mock_backend.get_entities_for_session.return_value = [
+        mock_backend.get_entities_for_episodes.return_value = [
             {"id": entity_id, "name": "SessionEntity", "entity_type": "person", "summary": "A person"},
         ]
-        service = GraphService(graph_backend=mock_backend)
+        service = GraphService(
+            graph_backend=mock_backend, episode_repo=mock_episode_repo
+        )
 
+        session_id = uuid4()
         result = await service.get_entities(
-            self.ORG_ID, self.PROJECT_ID, session_id=uuid4(),
+            self.ORG_ID,
+            self.PROJECT_ID,
+            session_id=session_id,
         )
 
         assert len(result["items"]) == 1
@@ -133,22 +145,40 @@ class TestGraphService:
         assert result["items"][0]["type"] == "person"
         assert result["next_cursor"] is None
         assert result["has_more"] is False
-        mock_backend.get_entities_for_session.assert_awaited_once()
+        mock_episode_repo.get_by_session_id.assert_awaited_once_with(
+            session_id,
+            limit=500,
+        )
+        mock_backend.get_entities_for_episodes.assert_awaited_once_with(
+            org_id=self.ORG_ID,
+            project_id=self.PROJECT_ID,
+            episode_ids=[episode_id],
+            limit=200,
+        )
 
     @pytest.mark.asyncio
     async def test_get_entities_with_session_id_and_type_filter(self) -> None:
         """session_id + entity_type filter applied client-side."""
+        mock_episode_repo = AsyncMock()
+        mock_episode_repo.get_by_session_id.return_value = (
+            [SimpleNamespace(id=uuid4())],
+            None,
+        )
         mock_backend = AsyncMock()
-        mock_backend.get_entities_for_session.return_value = [
+        mock_backend.get_entities_for_episodes.return_value = [
             {"id": uuid4(), "name": "Alice", "entity_type": "person", "summary": ""},
             {"id": uuid4(), "name": "Org", "entity_type": "organization", "summary": ""},
             {"id": uuid4(), "name": "Bob", "entity_type": "person", "summary": ""},
         ]
-        service = GraphService(graph_backend=mock_backend)
+        service = GraphService(
+            graph_backend=mock_backend, episode_repo=mock_episode_repo
+        )
 
         result = await service.get_entities(
-            self.ORG_ID, self.PROJECT_ID,
-            entity_type="person", session_id=uuid4(),
+            self.ORG_ID,
+            self.PROJECT_ID,
+            entity_type="person",
+            session_id=uuid4(),
         )
 
         assert len(result["items"]) == 2
@@ -313,7 +343,7 @@ class TestGraphService:
 
     @pytest.mark.asyncio
     async def test_get_communities_success(self) -> None:
-        """Backend returns community entities with member_count from attributes."""
+        """member_count is derived from MEMBER_OF edges, not stored attributes."""
         community_id = uuid4()
         mock_backend = AsyncMock()
         mock_backend.list_entities.return_value = {
@@ -323,12 +353,16 @@ class TestGraphService:
                     "name": "Tech Cluster",
                     "entity_type": "community",
                     "summary": "A tech community",
-                    "attributes": {"member_count": 42},
                 },
             ],
             "next_cursor": None,
             "has_more": False,
         }
+        mock_backend.get_all_relationships.return_value = [
+            {"id": str(i), "source_id": str(uuid4()), "target_id": community_id,
+             "type": "member_of"}
+            for i in range(42)
+        ]
         service = GraphService(graph_backend=mock_backend)
 
         result = await service.get_communities(self.ORG_ID, self.PROJECT_ID)
@@ -344,7 +378,7 @@ class TestGraphService:
 
     @pytest.mark.asyncio
     async def test_get_communities_no_member_count(self) -> None:
-        """Community without member_count attribute defaults to 0."""
+        """Community with no MEMBER_OF edges defaults to 0."""
         mock_backend = AsyncMock()
         mock_backend.list_entities.return_value = {
             "items": [
@@ -353,12 +387,12 @@ class TestGraphService:
                     "name": "No Count Community",
                     "entity_type": "community",
                     "summary": "",
-                    "attributes": None,
                 },
             ],
             "next_cursor": None,
             "has_more": False,
         }
+        mock_backend.get_all_relationships.return_value = []
         service = GraphService(graph_backend=mock_backend)
 
         result = await service.get_communities(self.ORG_ID, self.PROJECT_ID)
@@ -369,27 +403,32 @@ class TestGraphService:
     @pytest.mark.asyncio
     async def test_get_communities_member_count_sorts_in_python(self) -> None:
         """member_count sort stays in Python — backend receives sort=None."""
+        community_a, community_b = uuid4(), uuid4()
         mock_backend = AsyncMock()
         mock_backend.list_entities.return_value = {
             "items": [
                 {
-                    "id": uuid4(),
+                    "id": community_b,
                     "name": "B",
                     "entity_type": "community",
                     "summary": "",
-                    "attributes": {"member_count": 1},
                 },
                 {
-                    "id": uuid4(),
+                    "id": community_a,
                     "name": "A",
                     "entity_type": "community",
                     "summary": "",
-                    "attributes": {"member_count": 9},
                 },
             ],
             "next_cursor": None,
             "has_more": False,
         }
+        mock_backend.get_all_relationships.return_value = [
+            *[{"id": str(i), "source_id": str(uuid4()), "target_id": community_b,
+               "type": "member_of"} for i in range(1)],
+            *[{"id": str(10 + i), "source_id": str(uuid4()), "target_id": community_a,
+               "type": "member_of"} for i in range(9)],
+        ]
         service = GraphService(graph_backend=mock_backend)
 
         result = await service.get_communities(

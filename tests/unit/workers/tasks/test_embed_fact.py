@@ -210,13 +210,23 @@ class TestEmbedFact:
 
             from workers.tasks.embed_fact import embed_fact
 
-            with pytest.raises(ExternalServiceError, match="dimension mismatch"):
+            with pytest.raises(ExternalServiceError) as exc_info:
                 await embed_fact(
                     ctx=ctx,
                     fact_id=_FACT_ID,
                     org_id=_ORG_ID,
                     content=_CONTENT,
                 )
+
+            # The message is assembled dynamically (it interpolates the actual
+            # length and CANONICAL_EMBED_DIM), so assert on the stable literal
+            # tail plus the structured detail rather than a brittle regex.
+            assert "Refusing to store." in str(exc_info.value)
+            assert exc_info.value.detail == {
+                "source": "embed_fact",
+                "got": 512,
+                "expected": 768,
+            }
 
     # ── Coverage gap: engine/session/bao_client edge cases ──────────────────
 
