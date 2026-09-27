@@ -27,12 +27,13 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from core.db import get_async_session
+from core.db import _register_pgvector_codec, get_async_session
 from tests.conftest import (
     _ensure_testcontainers_env,
     _start_falkordb_container,
     _start_postgres_container,
     _start_redis_container,
+    sync_database_url,
 )
 
 if TYPE_CHECKING:
@@ -83,8 +84,8 @@ async def engine():
 
     # ── Step 1: Run Alembic migrations via a sync engine ─────────────────
     pg_url = pg_container.get_connection_url()
-    # Strip the asyncpg driver suffix — Alembic runs in a sync context
-    sync_url = pg_url.replace("+asyncpg", "")
+    # Alembic runs in a sync context — pin the sync driver explicitly
+    sync_url = sync_database_url(pg_url)
 
     from sqlalchemy import create_engine as create_sync_engine
 
@@ -106,6 +107,14 @@ async def engine():
         poolclass=NullPool,
         pool_pre_ping=True,
     )
+    # This test engine bypasses ``core.db.init_db_engine``, so it also bypasses
+    # the prod factory's ``_register_pgvector_codec`` call (core/db.py:87).
+    # Without the codec, asyncpg cannot decode the native ``VECTOR(768)`` OID
+    # and every read/write touching ``episodes.embedding`` / ``facts.embedding``
+    # raises ``DataError: expected str, got list``. Reuse the prod helper
+    # verbatim — the private-underscore import is intentional; do not
+    # "clean it up" or inline a local copy.
+    _register_pgvector_codec(async_engine)
 
     # ── Step 3: Seed bootstrap data ──────────────────────────────────────
     # Many integration tests assume a well-known organization UUID exists.

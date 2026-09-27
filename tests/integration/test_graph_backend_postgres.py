@@ -31,6 +31,7 @@ from tests.conftest import (
     _ensure_testcontainers_env,
     _run_alembic_upgrade,
     _start_postgres_container,
+    sync_database_url,
 )
 
 pytestmark = [
@@ -64,7 +65,7 @@ def setup_module() -> None:
     from sqlalchemy import create_engine as create_sync_engine
     from sqlalchemy import text
 
-    sync_url = url.replace("+asyncpg", "")  # strip asyncpg driver for sync engine
+    sync_url = sync_database_url(url)  # pin the sync driver for the sync engine
     sync_engine = create_sync_engine(sync_url, pool_pre_ping=True)
     with sync_engine.begin() as conn:
         conn.execute(

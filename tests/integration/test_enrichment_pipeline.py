@@ -64,7 +64,10 @@ async def pipeline_app(engine) -> tuple[Any, str, int]:
     assert pg_container is not None, "Testcontainers PG not found on engine"
     assert redis_container is not None, "Testcontainers Redis not found on engine"
 
-    pg_url = str(engine.url).replace("postgresql+asyncpg://", "postgresql://")
+    # The dead bare-``postgresql://`` URL that used to live here is gone: the
+    # async URL below is the only one consumed, and a bare scheme would have
+    # inherited SQLAlchemy's default sync dialect. Use ``sync_database_url``
+    # from ``tests.conftest`` if a sync engine is ever needed here.
     asyncpg_url = str(engine.url)
     redis_host = redis_container.get_container_host_ip()
     redis_port = redis_container.get_exposed_port(6379)

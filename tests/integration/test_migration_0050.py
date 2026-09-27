@@ -27,6 +27,7 @@ from sqlalchemy import create_engine, text
 from tests.conftest import (
     _ensure_testcontainers_env,
     _start_postgres_container,
+    sync_database_url,
 )
 
 pytestmark = pytest.mark.integration
@@ -66,7 +67,7 @@ def pg() -> Any:
 @pytest.fixture(scope="module")
 def sync_engine(pg: Any) -> Any:
     """A sync engine to the testcontainers PG (Alembic runs synchronously)."""
-    url = pg.get_connection_url().replace("+asyncpg", "")
+    url = sync_database_url(pg.get_connection_url())
     engine = create_engine(url, pool_pre_ping=True)
     yield engine
     engine.dispose()
