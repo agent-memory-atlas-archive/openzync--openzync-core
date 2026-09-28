@@ -413,178 +413,182 @@ async def process_facts_output(
     facts: list[dict] = [
         dict(f.model_dump(), _slot=i) for i, f in enumerate(parsed.facts, start=1)
     ]
-    if not facts:
-        return ([], {}) if return_slot_map else []
+    valid_facts = _filter_facts(facts) if facts else []
+    if valid_facts:
+        resolved = _resolve_fact_entities(valid_facts, known_entities)
+        resolved_facts = _deduplicate_facts(resolved, existing_facts)
+    else:
+        resolved_facts = []
 
-    valid_facts = _filter_facts(facts)
-    if not valid_facts:
-        return ([], {}) if return_slot_map else []
-
-    resolved_facts = _resolve_fact_entities(valid_facts, known_entities)
-    resolved_facts = _deduplicate_facts(resolved_facts, existing_facts)
-    if not resolved_facts:
-        return ([], {}) if return_slot_map else []
-
-    # ── Batch-persist all new facts via supersession ───────────────────────
-    # Conflicting active facts (same SPO identity) are superseded in the
-    # same transaction; identical-content facts are skipped so ARQ retries
-    # are idempotent.  Enrichment bit handling below is unchanged —
-    # supersession is a side effect, not episode state.
-    from services.cache_service import CacheService
-    from services.fact_invalidation_service import (
-        PURGE_ONLY_CACHE_TTL,
-        FactInvalidationService,
-    )
-    from services.graph_edge_sync_service import GraphEdgeSyncService
-
-    invalidation = FactInvalidationService(
-        db=db,
-        fact_repo=fact_repo,
-        cache_service=(
-            CacheService(arq_redis, default_ttl=PURGE_ONLY_CACHE_TTL)
-            if arq_redis is not None
-            else None
-        ),
-        graph_sync=(
-            GraphEdgeSyncService(backends=[graph_backend])
-            if graph_backend is not None
-            else None
-        ),
-    )
-    result = await invalidation.ingest_with_supersession(
-        org_id=uuid.UUID(org_id),
-        project_id=uuid.UUID(project_id),
-        user_id=uuid.UUID(user_id),
-        facts=resolved_facts,
-        source_episode_id=uuid.UUID(episode_id),
-        insert_mode="batch_create_or_skip",
-    )
-    new_facts = result.created
-
-    # Build a lookup from content string → input fact dict to match returned
-    # Fact ORM objects back to their original input for entity resolution,
-    # graph upserts, and the invalidation slot map.  Keyed on the SAME
-    # content fallback the supersession service computes in
-    # ``_prepare_entry`` (``fact.get("content") or "s p o"``) — an SPO-only
-    # key would silently miss facts with explicit LLM content, losing the
-    # slot linkage and degrading a successor invalidation to a retraction
-    # (D1 case-1 edge expiry despite a successor existing).
-    content_to_fact: dict[str, dict] = {
-        f.get("content") or f"{f['subject']} {f['predicate']} {f['object']}": f
-        for f in resolved_facts
-    }
-
-    persisted_ids: list[str] = []
-
-    duplicates_count = len(resolved_facts) - len(new_facts)
-    if duplicates_count:
-        logger.info(
-            "fact_extraction.duplicates_skipped",
-            episode_id=episode_id,
-            count=duplicates_count,
-            superseded_count=result.superseded_count,
+    if resolved_facts:
+        # ── Batch-persist all new facts via supersession ───────────────────
+        # Conflicting active facts (same SPO identity) are superseded in the
+        # same transaction; identical-content facts are skipped so ARQ retries
+        # are idempotent.  Enrichment bit handling below is unchanged —
+        # supersession is a side effect, not episode state.
+        from services.cache_service import CacheService
+        from services.fact_invalidation_service import (
+            PURGE_ONLY_CACHE_TTL,
+            FactInvalidationService,
         )
+        from services.graph_edge_sync_service import GraphEdgeSyncService
 
-    # ── Post-insert per-fact processing ─────────────────────────────────────
-    # Entity resolution fallback + graph relationship materialization for
-    # newly created facts only.
-    for fact_obj in new_facts:
-        persisted_ids.append(str(fact_obj.id))
+        invalidation = FactInvalidationService(
+            db=db,
+            fact_repo=fact_repo,
+            cache_service=(
+                CacheService(arq_redis, default_ttl=PURGE_ONLY_CACHE_TTL)
+                if arq_redis is not None
+                else None
+            ),
+            graph_sync=(
+                GraphEdgeSyncService(backends=[graph_backend])
+                if graph_backend is not None
+                else None
+            ),
+        )
+        result = await invalidation.ingest_with_supersession(
+            org_id=uuid.UUID(org_id),
+            project_id=uuid.UUID(project_id),
+            user_id=uuid.UUID(user_id),
+            facts=resolved_facts,
+            source_episode_id=uuid.UUID(episode_id),
+            insert_mode="batch_create_or_skip",
+        )
+        new_facts = result.created
 
-        input_fact = content_to_fact.get(fact_obj.content)
-        if input_fact is None:
-            continue  # guard against logic errors
+        # Build a lookup from content string → input fact dict to match
+        # returned Fact ORM objects back to their original input for entity
+        # resolution, graph upserts, and the invalidation slot map.  Keyed
+        # on the SAME content fallback the supersession service computes in
+        # ``_prepare_entry`` (``fact.get("content") or "s p o"``) — an
+        # SPO-only key would silently miss facts with explicit LLM content,
+        # losing the slot linkage and degrading a successor invalidation to
+        # a retraction (D1 case-1 edge expiry despite a successor existing).
+        content_to_fact: dict[str, dict] = {
+            f.get("content") or f"{f['subject']} {f['predicate']} {f['object']}": f
+            for f in resolved_facts
+        }
 
-        subj_id: uuid.UUID | None = input_fact.get("subject_entity_id")
-        obj_id: uuid.UUID | None = input_fact.get("object_entity_id")
+        persisted_ids: list[str] = []
 
-        # ── Live entity lookup fallback ──────────────────────────────────
-        # extract_entities always completes before this worker runs (it
-        # chains after via enqueue), so entities are guaranteed to be in
-        # the DB.  If the graph backend is unavailable, log the error and
-        # continue — fact persistence to PostgreSQL is the primary concern.
-        if subj_id is None and entity_repo is not None:
-            try:
-                subj_node = await entity_repo.get_entity_by_name(
-                    org_id=uuid.UUID(org_id),
-                    project_id=uuid.UUID(project_id),
-                    name=input_fact["subject"],
-                )
-            except GraphBackendUnavailableError:
-                subj_node = None
-                logger.error(
-                    "fact_extraction.graph_backend_unavailable",
-                    episode_id=episode_id,
-                    operation="get_entity_by_name",
-                    role="subject",
-                    entity_name=input_fact["subject"],
-                    exc_info=True,
-                )
-            if subj_node is not None:
-                subj_id = uuid.UUID(subj_node["id"])
-                input_fact["subject_entity_id"] = subj_id
-                logger.info(
-                    "fact_extraction.live_entity_resolved",
-                    episode_id=episode_id,
-                    entity_name=input_fact["subject"],
-                    role="subject",
-                )
+        duplicates_count = len(resolved_facts) - len(new_facts)
+        if duplicates_count:
+            logger.info(
+                "fact_extraction.duplicates_skipped",
+                episode_id=episode_id,
+                count=duplicates_count,
+                superseded_count=result.superseded_count,
+            )
 
-        if obj_id is None and entity_repo is not None:
-            try:
-                obj_node = await entity_repo.get_entity_by_name(
-                    org_id=uuid.UUID(org_id),
-                    project_id=uuid.UUID(project_id),
-                    name=input_fact["object"],
-                )
-            except GraphBackendUnavailableError:
-                obj_node = None
-                logger.error(
-                    "fact_extraction.graph_backend_unavailable",
-                    episode_id=episode_id,
-                    operation="get_entity_by_name",
-                    role="object",
-                    entity_name=input_fact["object"],
-                    exc_info=True,
-                )
-            if obj_node is not None:
-                obj_id = uuid.UUID(obj_node["id"])
-                input_fact["object_entity_id"] = obj_id
-                logger.info(
-                    "fact_extraction.live_entity_resolved",
-                    episode_id=episode_id,
-                    entity_name=input_fact["object"],
-                    role="object",
-                )
+        # ── Post-insert per-fact processing ─────────────────────────────────
+        # Entity resolution fallback + graph relationship materialization for
+        # newly created facts only.
+        for fact_obj in new_facts:
+            persisted_ids.append(str(fact_obj.id))
 
-        # ── Graph relationship upsert ────────────────────────────────────
-        # When both entity IDs are resolved, materialize the relationship
-        # in the graph for traversal queries.
-        if subj_id is not None and obj_id is not None and entity_repo is not None:
-            try:
-                await entity_repo.upsert_relationship(
-                    subject=input_fact["subject"],
-                    predicate=input_fact["predicate"],
-                    obj=input_fact["object"],
-                    org_id=uuid.UUID(org_id),
-                    project_id=uuid.UUID(project_id),
-                )
-            except GraphBackendUnavailableError:
-                # Non-fatal: fact is already persisted in PostgreSQL,
-                # graph relationship is secondary.
-                logger.error(
-                    "fact_extraction.graph_backend_unavailable",
-                    episode_id=episode_id,
-                    operation="upsert_relationship",
-                    subject=input_fact["subject"],
-                    predicate=input_fact["predicate"],
-                    object=input_fact["object"],
-                    exc_info=True,
-                )
+            input_fact = content_to_fact.get(fact_obj.content)
+            if input_fact is None:
+                continue  # guard against logic errors
+
+            subj_id: uuid.UUID | None = input_fact.get("subject_entity_id")
+            obj_id: uuid.UUID | None = input_fact.get("object_entity_id")
+
+            # ── Live entity lookup fallback ──────────────────────────────
+            # extract_entities always completes before this worker runs (it
+            # chains after via enqueue), so entities are guaranteed to be in
+            # the DB.  If the graph backend is unavailable, log the error and
+            # continue — fact persistence to PostgreSQL is the primary
+            # concern.
+            if subj_id is None and entity_repo is not None:
+                try:
+                    subj_node = await entity_repo.get_entity_by_name(
+                        org_id=uuid.UUID(org_id),
+                        project_id=uuid.UUID(project_id),
+                        name=input_fact["subject"],
+                    )
+                except GraphBackendUnavailableError:
+                    subj_node = None
+                    logger.error(
+                        "fact_extraction.graph_backend_unavailable",
+                        episode_id=episode_id,
+                        operation="get_entity_by_name",
+                        role="subject",
+                        entity_name=input_fact["subject"],
+                        exc_info=True,
+                    )
+                if subj_node is not None:
+                    subj_id = uuid.UUID(subj_node["id"])
+                    input_fact["subject_entity_id"] = subj_id
+                    logger.info(
+                        "fact_extraction.live_entity_resolved",
+                        episode_id=episode_id,
+                        entity_name=input_fact["subject"],
+                        role="subject",
+                    )
+
+            if obj_id is None and entity_repo is not None:
+                try:
+                    obj_node = await entity_repo.get_entity_by_name(
+                        org_id=uuid.UUID(org_id),
+                        project_id=uuid.UUID(project_id),
+                        name=input_fact["object"],
+                    )
+                except GraphBackendUnavailableError:
+                    obj_node = None
+                    logger.error(
+                        "fact_extraction.graph_backend_unavailable",
+                        episode_id=episode_id,
+                        operation="get_entity_by_name",
+                        role="object",
+                        entity_name=input_fact["object"],
+                        exc_info=True,
+                    )
+                if obj_node is not None:
+                    obj_id = uuid.UUID(obj_node["id"])
+                    input_fact["object_entity_id"] = obj_id
+                    logger.info(
+                        "fact_extraction.live_entity_resolved",
+                        episode_id=episode_id,
+                        entity_name=input_fact["object"],
+                        role="object",
+                    )
+
+            # ── Graph relationship upsert ────────────────────────────────
+            # When both entity IDs are resolved, materialize the relationship
+            # in the graph for traversal queries.
+            if subj_id is not None and obj_id is not None and entity_repo is not None:
+                try:
+                    await entity_repo.upsert_relationship(
+                        subject=input_fact["subject"],
+                        predicate=input_fact["predicate"],
+                        obj=input_fact["object"],
+                        org_id=uuid.UUID(org_id),
+                        project_id=uuid.UUID(project_id),
+                    )
+                except GraphBackendUnavailableError:
+                    # Non-fatal: fact is already persisted in PostgreSQL,
+                    # graph relationship is secondary.
+                    logger.error(
+                        "fact_extraction.graph_backend_unavailable",
+                        episode_id=episode_id,
+                        operation="upsert_relationship",
+                        subject=input_fact["subject"],
+                        predicate=input_fact["predicate"],
+                        object=input_fact["object"],
+                        exc_info=True,
+                    )
+    else:
+        new_facts = []
+        persisted_ids = []
+        content_to_fact = {}
 
     # ── Enrichment bit ──────────────────────────────────────────────────────
     # Set after fact persistence, inside the same transaction —
     # rollback-safe.  Only applied when an episode_repo is provided.
+    # Stamped unconditionally: an episode whose facts were extracted and
+    # assessed (or skipped because empty / filtered / deduplicated) must
+    # not re-enrich.
     if episode_repo is not None:
         await episode_repo.apply_enrichment_bits(
             uuid.UUID(episode_id), ENRICHMENT_FACTS
