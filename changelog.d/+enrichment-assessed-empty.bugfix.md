@@ -1,0 +1,1 @@
+Fixed episodes wedged in the enrichment queue forever when extraction finds nothing: empty structured output and empty/filtered/deduplicated fact output now stamp their completion bit (assessed, nothing to store) instead of leaving the episode permanently pending, so the queue drains.

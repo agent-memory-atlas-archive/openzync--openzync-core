@@ -91,13 +91,16 @@ async def test_get_metrics_summary_success() -> None:
     app, db_mock = _create_app()
     transport = ASGITransport(app=app)
 
-    # Mock DB scalar results — _fetch_db_counts calls scalar() 7 times:
-    # episodes (6), users (1).  Graph entity counts no longer come from SQL
+    # Mock DB scalar results — _fetch_db_counts calls scalar() 9 times in
+    # order: total, 24h, archived, enrichable, in_progress, pending,
+    # fully_enriched, with_embeddings, users (episodes 8, users 1).
+    # added_total (42) == enrichable (40) + archived (2) by construction.
+    # Graph entity counts no longer come from SQL
     # (GraphStatsService reads the graph backend, not the never-written
     # graph_entities PG stub), so they are driven by the fake backend below.
     # All execute() calls return the same MagicMock (set in _create_app), so
     # scalar.side_effect on the shared return_value distributes values in order.
-    db_mock.execute.return_value.scalar.side_effect = [42, 10, 5, 2, 35, 30, 3]
+    db_mock.execute.return_value.scalar.side_effect = [42, 10, 2, 40, 5, 2, 35, 30, 3]
 
     # Project scope: GraphStatsService.resolve_project_ids pages through
     # ProjectRepository.list() — one project here, so the backend is fanned
@@ -130,7 +133,7 @@ async def test_get_metrics_summary_success() -> None:
             enrichment_pending=2,
             fully_enriched=35,
             with_embeddings=30,
-            fully_enriched_pct=83.3,
+            fully_enriched_pct=87.5,
         ),
         graphs=GraphStats(
             entities_total=100,
@@ -153,7 +156,8 @@ async def test_get_metrics_summary_success() -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["episodes"]["added_total"] == 42
-    assert body["episodes"]["fully_enriched_pct"] == 83.3
+    # Rebased denominator: fully_enriched (35) / enrichable (40), not total (42).
+    assert body["episodes"]["fully_enriched_pct"] == 87.5
     assert body["graphs"]["entities_total"] == 100
     assert body["users_total"] == 3
     assert body["request_rate"]["2xx"] == 5.0

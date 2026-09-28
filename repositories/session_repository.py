@@ -595,7 +595,8 @@ class SessionRepository:
             .where(
                 Episode.session_id == Session.id,
                 Episode.is_deleted.is_(False),
-                Episode.enrichment_status != ENRICHMENT_ALL,
+                (Episode.enrichment_status.op("&")(ENRICHMENT_ALL))
+                != ENRICHMENT_ALL,
                 Episode.project_id.not_in(archived_project_ids()),
             )
             .correlate(Session)

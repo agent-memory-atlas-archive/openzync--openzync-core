@@ -18,6 +18,7 @@ import pytest
 
 from schemas.llm_outputs import FactExtractionOutput
 from services.fact_invalidation_service import FactIngestionResult
+from workers.tasks.base import ENRICHMENT_FACTS
 from workers.tasks.extract_facts import _filter_facts, process_facts_output
 
 _EPISODE_ID = str(uuid4())
@@ -176,7 +177,7 @@ class TestProcessFactsOutput:
         fact_repo: MagicMock,
         episode_repo: MagicMock,
     ) -> None:
-        """No facts extracted → nothing persisted, no invalidation run."""
+        """No facts extracted → nothing persisted, no invalidation run; bit 2 stamped."""
         with patch(
             "services.fact_invalidation_service.FactInvalidationService"
         ) as mock_inval_cls:
@@ -199,7 +200,11 @@ class TestProcessFactsOutput:
 
         assert result == []
         mock_inval_cls.assert_not_called()
-        episode_repo.apply_enrichment_bits.assert_not_called()
+        # Assessed-empty: nothing to persist, but bit 2 is stamped so the
+        # episode is not re-enriched forever.
+        episode_repo.apply_enrichment_bits.assert_awaited_once_with(
+            UUID(_EPISODE_ID), ENRICHMENT_FACTS
+        )
 
     @pytest.mark.asyncio
     async def test_all_facts_filtered_no_persistence(
@@ -208,7 +213,7 @@ class TestProcessFactsOutput:
         fact_repo: MagicMock,
         episode_repo: MagicMock,
     ) -> None:
-        """Only sub-threshold facts → nothing persisted."""
+        """Only sub-threshold facts → nothing persisted; bit 2 stamped."""
         with patch(
             "services.fact_invalidation_service.FactInvalidationService"
         ) as mock_inval_cls:
@@ -234,6 +239,11 @@ class TestProcessFactsOutput:
 
         assert result == []
         mock_inval_cls.assert_not_called()
+        # Assessed-empty: all facts filtered, but bit 2 is stamped so the
+        # episode is not re-enriched forever.
+        episode_repo.apply_enrichment_bits.assert_awaited_once_with(
+            UUID(_EPISODE_ID), ENRICHMENT_FACTS
+        )
 
     @pytest.mark.asyncio
     async def test_success_persists_via_supersession(

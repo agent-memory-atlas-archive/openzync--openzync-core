@@ -508,14 +508,16 @@ async def _latency_percentiles(
 async def _queue_depth_over_time(
     db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
 ) -> dict:
-    # Was Prometheus, now DB: pending enrichments (enrichment_status != ALL) per day
+    # Was Prometheus, now DB: pending enrichments (bits 0-5 not all set)
+    # per day
     # Progress metric — archived projects are excluded because the episode
     # workers early-return on them, so including them would report a permanent
     # non-draining phantom backlog that looks like a wedged queue.
     conditions = [
         Episode.organization_id == org_uuid,
         Episode.is_deleted.is_(False),
-        Episode.enrichment_status != ENRICHMENT_ALL,
+        (Episode.enrichment_status.op("&")(ENRICHMENT_ALL))
+        != ENRICHMENT_ALL,
         Episode.project_id.not_in(archived_project_ids()),
         Episode.created_at >= func.now() - text(f"interval '{days} days'"),
     ]
@@ -784,7 +786,8 @@ async def _fetch_db_counts(
         select(func.count(Episode.id)).where(
             Episode.organization_id == org_id,
             Episode.is_deleted.is_(False),
-            Episode.enrichment_status != ENRICHMENT_ALL,
+            (Episode.enrichment_status.op("&")(ENRICHMENT_ALL))
+            != ENRICHMENT_ALL,
             Episode.project_id.not_in(archived_project_ids()),
         )
     )
@@ -806,7 +809,8 @@ async def _fetch_db_counts(
         select(func.count(Episode.id)).where(
             Episode.organization_id == org_id,
             Episode.is_deleted.is_(False),
-            Episode.enrichment_status == ENRICHMENT_ALL,
+            (Episode.enrichment_status.op("&")(ENRICHMENT_ALL))
+            == ENRICHMENT_ALL,
             Episode.project_id.not_in(archived_project_ids()),
         )
     )

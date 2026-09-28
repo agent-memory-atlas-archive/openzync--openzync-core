@@ -1,0 +1,1 @@
+Fixed enrichment progress stalling at 41%: episodes in archived projects are now excluded from the progress counts (the workers never enrich them, so they sat as a permanent phantom backlog of ~3089). The dashboard percentage now runs 0–100% over enrichable episodes only, with new `archived_episodes`/`enrichable_total` fields on the summary so the excluded volume stays visible.
