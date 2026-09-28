@@ -1,4 +1,5 @@
 """Unit tests for embed_fact task."""
+
 from __future__ import annotations
 
 import time
@@ -111,7 +112,12 @@ class TestEmbedFact:
 
             from workers.tasks.embed_fact import embed_fact
 
-            with pytest.raises(Exception):
+            # embed_fact.py:198 — ``org_cfg.embedding_backend is None`` raises
+            # ``SearchLegFailedError``.  The message interpolates the org id,
+            # so only the stable literal prefix is pinned.
+            with pytest.raises(
+                SearchLegFailedError, match="No embedding backend configured"
+            ):
                 await embed_fact(
                     ctx=ctx,
                     fact_id=_FACT_ID,
@@ -384,7 +390,9 @@ class TestEmbedFact:
             db = self._make_db()
             from workers.tasks.embed_fact import embed_fact
 
-            with pytest.raises(SearchLegFailedError, match="Failed to fetch org config"):
+            with pytest.raises(
+                SearchLegFailedError, match="Failed to fetch org config"
+            ):
                 await embed_fact(
                     ctx=self._ctx(db),
                     fact_id=_FACT_ID,
@@ -531,6 +539,4 @@ class TestEmbedFactRetryBehaviour:
             assert mock_llm.embed.call_count == 2
             mock_sleep.assert_awaited_once()
             executed = self._executed_sql(db)
-            assert any(
-                "CAST(:embedding AS vector(768))" in sql for sql in executed
-            )
+            assert any("CAST(:embedding AS vector(768))" in sql for sql in executed)

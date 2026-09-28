@@ -41,7 +41,9 @@ def _start_postgres_container() -> object:
     container = PostgresContainer(
         image="pgvector/pgvector:pg15",
         username="openzync",
-        password="openzync",
+        # Disposable credential for a throwaway testcontainer that lives only
+        # for the duration of the test session — not a real secret.
+        password="openzync",  # noqa: S106
         dbname="openzync_test",
         driver="asyncpg",
     )

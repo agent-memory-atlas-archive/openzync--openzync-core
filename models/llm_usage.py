@@ -97,6 +97,7 @@ class LLMUsage(CreatedAtMixin, Base):
     )
 
     def __repr__(self) -> str:
+        """Return a debug-friendly repr with id, model, and token totals."""
         return (
             f"<LLMUsage id={self.id} model={self.model!r} "
             f"total_tokens={self.total_tokens}>"

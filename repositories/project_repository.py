@@ -99,9 +99,7 @@ class ProjectRepository:
         )
         return result.scalar_one_or_none()
 
-    async def get_by_name(
-        self, organization_id: UUID, name: str
-    ) -> Project | None:
+    async def get_by_name(self, organization_id: UUID, name: str) -> Project | None:
         """Look up a project by name within an organisation.
 
         Args:
@@ -120,9 +118,7 @@ class ProjectRepository:
         )
         return result.scalar_one_or_none()
 
-    async def is_archived(
-        self, organization_id: UUID, project_id: UUID
-    ) -> bool:
+    async def is_archived(self, organization_id: UUID, project_id: UUID) -> bool:
         """Check whether a project is archived (or missing).
 
         Single-column SELECT scoped to the org. Fail-closed: returns
@@ -196,15 +192,12 @@ class ProjectRepository:
             query = query.where(Project.is_archived.is_(False))
 
         if user_id is not None:
-            query = (
-                query
-                .join(ProjectMember, Project.id == ProjectMember.project_id)
-                .where(ProjectMember.user_id == user_id)
-            )
+            query = query.join(
+                ProjectMember, Project.id == ProjectMember.project_id
+            ).where(ProjectMember.user_id == user_id)
 
         result = await self._db.execute(
-            query
-            .order_by(
+            query.order_by(
                 *resolve_order_by(
                     PROJECT_SORTABLE_COLUMNS,
                     Project.id,
@@ -250,9 +243,7 @@ class ProjectRepository:
         await self._db.refresh(project)
         return project
 
-    async def archive(
-        self, organization_id: UUID, project_id: UUID
-    ) -> Project | None:
+    async def archive(self, organization_id: UUID, project_id: UUID) -> Project | None:
         """Soft-delete (archive) a project.
 
         All sessions and entities remain in the database but the project
@@ -353,9 +344,7 @@ class ProjectRepository:
         await self._db.refresh(member)
         return member
 
-    async def remove_member(
-        self, project_id: UUID, user_id: UUID
-    ) -> bool:
+    async def remove_member(self, project_id: UUID, user_id: UUID) -> bool:
         """Remove a user from a project.
 
         Args:
@@ -378,9 +367,7 @@ class ProjectRepository:
         await self._db.flush()
         return True
 
-    async def get_member(
-        self, project_id: UUID, user_id: UUID
-    ) -> ProjectMember | None:
+    async def get_member(self, project_id: UUID, user_id: UUID) -> ProjectMember | None:
         """Check if a user is a member of a project and return their membership.
 
         Args:
@@ -399,7 +386,8 @@ class ProjectRepository:
         return result.scalar_one_or_none()
 
     async def list_members(
-        self, project_id: UUID,
+        self,
+        project_id: UUID,
         sort: SortSpec | None = None,
     ) -> list[ProjectMember]:
         """List all members of a project with users eagerly loaded.

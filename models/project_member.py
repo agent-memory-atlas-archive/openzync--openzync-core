@@ -79,6 +79,7 @@ class ProjectMember(TimestampMixin, Base):
     )
 
     def __repr__(self) -> str:
+        """Return a debug-friendly repr with project, user, and role."""
         return (
             f"<ProjectMember project={self.project_id} "
             f"user={self.user_id} role={self.role!r}>"

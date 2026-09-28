@@ -313,17 +313,19 @@ class GraphService:
             import asyncio
 
             per_subject_limit = min(limit, 200)
-            results = await asyncio.gather(*[
-                self._backend.list_entity_edges(
-                    org_id=org_id,
-                    project_id=project_id,
-                    entity_id=eid,
-                    predicate=predicate,
-                    limit=per_subject_limit,
-                    sort=sort,
-                )
-                for eid in subject_ids
-            ])
+            results = await asyncio.gather(
+                *[
+                    self._backend.list_entity_edges(
+                        org_id=org_id,
+                        project_id=project_id,
+                        entity_id=eid,
+                        predicate=predicate,
+                        limit=per_subject_limit,
+                        sort=sort,
+                    )
+                    for eid in subject_ids
+                ]
+            )
             seen: set[str] = set()
             items: list[dict[str, Any]] = []
             for r in results:

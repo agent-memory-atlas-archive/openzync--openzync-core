@@ -30,6 +30,7 @@ from core.exceptions import SearchLegFailedError
 from middleware.metrics import graph_search_latency_seconds, reranker_latency_seconds
 from models.episode import Episode
 from models.fact import Fact
+from packages.reranker import DEFAULT_RERANK_TOP_K, DEFAULT_RERANK_TOP_N, RRF_K
 
 if TYPE_CHECKING:
     from packages.graph_backend.interface import GraphBackend
@@ -37,8 +38,6 @@ if TYPE_CHECKING:
     from schemas.organization_config import OrgConfigBase
 
 logger = logging.getLogger(__name__)
-
-from packages.reranker import DEFAULT_RERANK_TOP_K, DEFAULT_RERANK_TOP_N, RRF_K
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 

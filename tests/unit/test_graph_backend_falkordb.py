@@ -138,7 +138,9 @@ def mock_graph(mock_client: MagicMock) -> AsyncMock:
 def backend(mock_client: MagicMock) -> FalkorGraphBackend:
     """A ``FalkorGraphBackend`` with schema bootstrap pre-completed."""
     bk = FalkorGraphBackend(client=mock_client, max_traversal_depth=2)
-    bk._schema_ensured = {"openzync_00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002": True}
+    bk._schema_ensured = {
+        "openzync_00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002": True
+    }
     return bk
 
 
@@ -163,12 +165,17 @@ def setup_traverse(mock_graph: AsyncMock) -> Callable[..., None]:
         _neighbors.clear()
         _neighbors.update(neighbors)
 
-        async def side_effect(query: str, params: dict[str, Any] | None = None) -> MockQueryResult:
+        async def side_effect(
+            query: str, params: dict[str, Any] | None = None
+        ) -> MockQueryResult:
             if not params:
                 return MockQueryResult([])
 
             # Neighbour discovery — RETURN DISTINCT neighbour.id
-            if "RETURN DISTINCT neighbour.id" in query or "RETURN DISTINCT node.id" in query:
+            if (
+                "RETURN DISTINCT neighbour.id" in query
+                or "RETURN DISTINCT node.id" in query
+            ):
                 cid = params.get("eid", "")
                 nids = _neighbors.get(str(cid), [])
                 return MockQueryResult([(nid,) for nid in nids])
@@ -265,7 +272,18 @@ class TestFalkorGraphBackendHelpers:
     @staticmethod
     def test_row_to_relationship() -> None:
         """_row_to_relationship converts a 10-column tuple to a rel dict."""
-        row = ("rid", "src", "tgt", "knows", '{"w":3}', "fact_str", 0.95, NOW_STR, None, NOW_STR)
+        row = (
+            "rid",
+            "src",
+            "tgt",
+            "knows",
+            '{"w":3}',
+            "fact_str",
+            0.95,
+            NOW_STR,
+            None,
+            NOW_STR,
+        )
         rel = FalkorGraphBackend._row_to_relationship(row)
         assert rel["id"] == "rid"
         assert rel["source_id"] == "src"
@@ -284,11 +302,23 @@ class TestFalkorGraphBackendHelpers:
         # Return distinct mocks per call so we can distinguish them
         client.select_graph.side_effect = lambda key: f"graph:{key}"
         bk = FalkorGraphBackend(client=client)
-        g1 = bk._get_graph(UUID("11111111-1111-1111-1111-111111111111"), UUID("22222222-2222-2222-2222-222222222222"))
-        g2 = bk._get_graph(UUID("33333333-3333-3333-3333-333333333333"), UUID("44444444-4444-4444-4444-444444444444"))
+        g1 = bk._get_graph(
+            UUID("11111111-1111-1111-1111-111111111111"),
+            UUID("22222222-2222-2222-2222-222222222222"),
+        )
+        g2 = bk._get_graph(
+            UUID("33333333-3333-3333-3333-333333333333"),
+            UUID("44444444-4444-4444-4444-444444444444"),
+        )
 
-        assert client.select_graph.call_args_list[0][0][0] == "openzync_11111111-1111-1111-1111-111111111111_22222222-2222-2222-2222-222222222222"
-        assert client.select_graph.call_args_list[1][0][0] == "openzync_33333333-3333-3333-3333-333333333333_44444444-4444-4444-4444-444444444444"
+        assert (
+            client.select_graph.call_args_list[0][0][0]
+            == "openzync_11111111-1111-1111-1111-111111111111_22222222-2222-2222-2222-222222222222"
+        )
+        assert (
+            client.select_graph.call_args_list[1][0][0]
+            == "openzync_33333333-3333-3333-3333-333333333333_44444444-4444-4444-4444-444444444444"
+        )
         assert g1 is not g2
 
 
@@ -358,7 +388,9 @@ class TestFalkorGraphBackendEntityCrud:
         """FalkorDB error is wrapped in ``ExternalServiceError``."""
         mock_graph.query.side_effect = RuntimeError("DB connection lost")
 
-        with pytest.raises(ExternalServiceError, match="FalkorDB schema bootstrap failed"):
+        with pytest.raises(
+            ExternalServiceError, match="FalkorDB schema bootstrap failed"
+        ):
             await backend.create_entity(
                 org_id=ORG_ID,
                 project_id=PROJ_ID,
@@ -500,7 +532,9 @@ class TestFalkorGraphBackendEntityCrud:
         mock_graph: AsyncMock,
     ) -> None:
         """All fields are included when provided."""
-        result_row = make_entity_row(name="new-name", entity_type="Org", summary="new summary")
+        result_row = make_entity_row(
+            name="new-name", entity_type="Org", summary="new summary"
+        )
         mock_graph.query.return_value = MockQueryResult([result_row])
 
         await backend.update_entity(
@@ -677,7 +711,10 @@ class TestFalkorGraphBackendRelationships:
         """Returns list of relationships for an entity."""
         result_rows = [
             make_relationship_row(
-                rel_id=REL_ID, source_id=ENTITY_ID, target_id=TARGET_ID, rel_type="likes",
+                rel_id=REL_ID,
+                source_id=ENTITY_ID,
+                target_id=TARGET_ID,
+                rel_type="likes",
             ),
         ]
         mock_graph.query.return_value = MockQueryResult(result_rows)
@@ -791,7 +828,9 @@ class TestFalkorGraphBackendTraversal:
         setup_traverse(
             entities={
                 str(ENTITY_ID): make_entity_row(entity_id=ENTITY_ID, name="Start"),
-                str(NEIGHBOR_ID): make_entity_row(entity_id=NEIGHBOR_ID, name="Neighbor"),
+                str(NEIGHBOR_ID): make_entity_row(
+                    entity_id=NEIGHBOR_ID, name="Neighbor"
+                ),
             },
             neighbors={str(ENTITY_ID): [str(NEIGHBOR_ID)]},
         )
@@ -840,7 +879,9 @@ class TestFalkorGraphBackendTraversal:
         setup_traverse(
             entities={
                 str(ENTITY_ID): make_entity_row(entity_id=ENTITY_ID, name="Start"),
-                str(NEIGHBOR_ID): make_entity_row(entity_id=NEIGHBOR_ID, name="Neighbor"),
+                str(NEIGHBOR_ID): make_entity_row(
+                    entity_id=NEIGHBOR_ID, name="Neighbor"
+                ),
             },
             neighbors={str(ENTITY_ID): [str(NEIGHBOR_ID)]},
         )
@@ -853,7 +894,9 @@ class TestFalkorGraphBackendTraversal:
             edge_types=["likes"],
         )
 
-        query = mock_graph.query.call_args_list[1][0][0]  # second query = neighbor discovery
+        query = mock_graph.query.call_args_list[1][0][
+            0
+        ]  # second query = neighbor discovery
         assert ":likes]" in query
         assert "invalid_at" in query
         assert "valid_from" in query
@@ -870,7 +913,9 @@ class TestFalkorGraphBackendTraversal:
         setup_traverse(
             entities={
                 str(ENTITY_ID): make_entity_row(entity_id=ENTITY_ID, name="Start"),
-                str(NEIGHBOR_ID): make_entity_row(entity_id=NEIGHBOR_ID, name="Neighbor"),
+                str(NEIGHBOR_ID): make_entity_row(
+                    entity_id=NEIGHBOR_ID, name="Neighbor"
+                ),
             },
             neighbors={str(ENTITY_ID): [str(NEIGHBOR_ID)]},
         )
@@ -897,7 +942,9 @@ class TestFalkorGraphBackendTraversal:
         setup_traverse(
             entities={
                 str(ENTITY_ID): make_entity_row(entity_id=ENTITY_ID, name="Start"),
-                str(NEIGHBOR_ID): make_entity_row(entity_id=NEIGHBOR_ID, name="Neighbor"),
+                str(NEIGHBOR_ID): make_entity_row(
+                    entity_id=NEIGHBOR_ID, name="Neighbor"
+                ),
             },
             neighbors={str(ENTITY_ID): [str(NEIGHBOR_ID)]},
         )
@@ -943,7 +990,9 @@ class TestFalkorGraphBackendTraversal:
         setup_traverse(
             entities={
                 str(ENTITY_ID): make_entity_row(entity_id=ENTITY_ID, name="Start"),
-                str(NEIGHBOR_ID): make_entity_row(entity_id=NEIGHBOR_ID, name="Neighbor"),
+                str(NEIGHBOR_ID): make_entity_row(
+                    entity_id=NEIGHBOR_ID, name="Neighbor"
+                ),
             },
             neighbors={str(ENTITY_ID): [str(NEIGHBOR_ID)]},
         )
@@ -1067,7 +1116,9 @@ class TestFalkorGraphBackendSearchAndListing:
             make_entity_row(entity_id=ENTITY_ID, name="A"),
             make_entity_row(entity_id=NEIGHBOR_ID, name="B"),
         ]
-        mock_graph.query.return_value = MockQueryResult(rows)  # 2 items, limit=3 → no overflow
+        mock_graph.query.return_value = MockQueryResult(
+            rows
+        )  # 2 items, limit=3 → no overflow
 
         result = await backend.list_entities(
             org_id=ORG_ID,
@@ -1092,7 +1143,9 @@ class TestFalkorGraphBackendSearchAndListing:
             )
             for i in range(6)
         ]
-        mock_graph.query.return_value = MockQueryResult(rows)  # 6 items, limit=5 → overflow
+        mock_graph.query.return_value = MockQueryResult(
+            rows
+        )  # 6 items, limit=5 → overflow
 
         result = await backend.list_entities(
             org_id=ORG_ID,
@@ -1149,7 +1202,10 @@ class TestFalkorGraphBackendSearchAndListing:
         """Returns paginated edges for an entity."""
         rows = [
             make_relationship_row(
-                rel_id=REL_ID, source_id=ENTITY_ID, target_id=TARGET_ID, rel_type="likes",
+                rel_id=REL_ID,
+                source_id=ENTITY_ID,
+                target_id=TARGET_ID,
+                rel_type="likes",
             ),
         ]
         mock_graph.query.return_value = MockQueryResult(rows)
@@ -1209,7 +1265,9 @@ class TestFalkorGraphBackendSearchAndListing:
     ) -> None:
         """FalkorDB error is wrapped in ``ExternalServiceError``."""
         mock_graph.query.side_effect = RuntimeError("edges failed")
-        with pytest.raises(ExternalServiceError, match="Failed to list edges for entity"):
+        with pytest.raises(
+            ExternalServiceError, match="Failed to list edges for entity"
+        ):
             await backend.list_entity_edges(ORG_ID, PROJ_ID, ENTITY_ID)
 
     # ── get_entity_with_edges ─────────────────────────────────────────────
@@ -1222,7 +1280,9 @@ class TestFalkorGraphBackendSearchAndListing:
         """Returns entity node + edges."""
         entity_row = make_entity_row()
         edge_row = make_relationship_row(
-            rel_id=REL_ID, source_id=ENTITY_ID, target_id=TARGET_ID,
+            rel_id=REL_ID,
+            source_id=ENTITY_ID,
+            target_id=TARGET_ID,
         )
 
         # First call = get_entity, second = list_entity_edges
@@ -1267,11 +1327,10 @@ class TestFalkorGraphBackendRetrieveGraph:
         # We need to control the second set of calls (traverse neighbour discovery)
         # For simplicity, mock get_entity inside traverse
         entity_row = make_entity_row(entity_id=ENTITY_ID, name="Match")
-        neighbor_row = make_entity_row(entity_id=NEIGHBOR_ID, name="Neighbor")
         mock_graph.query.side_effect = [
             MockQueryResult([match_row]),  # search_entities
             MockQueryResult([entity_row]),  # get_entity for start node in traverse
-            MockQueryResult([]),           # traverse: no more neighbors after entity
+            MockQueryResult([]),  # traverse: no more neighbors after entity
         ]
 
         result = await backend.retrieve_graph(
