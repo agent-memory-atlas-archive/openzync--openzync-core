@@ -1,8 +1,9 @@
 """Community detection algorithms — Label Propagation on entity graphs.
 
-Entities are read from PostgreSQL ``graph_entities`` and relationships
-from ``graph_relationships``.  A ``networkx.Graph`` is built and Label
-Propagation is run to detect clusters.
+Entity and relationship dicts are provided by the configured graph backend
+(``GraphBackend``): entities carry ``id``/``name``/``type`` and
+relationships carry ``source_id``/``target_id``/``type``. A
+``networkx.Graph`` is built and Label Propagation is run to detect clusters.
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ def build_entity_graph(
     Args:
         entities: List of entity dicts with at minimum ``id`` and ``name`` keys.
         relationships: List of relationship dicts with ``source_id``,
-            ``target_id``, and ``relationship_type`` keys.
+            ``target_id``, and ``type`` keys (``relationship_type``
+            accepted as fallback for backends that emit it).
 
     Returns:
         A ``networkx.Graph`` with entity IDs as nodes and relationship types
@@ -46,7 +48,11 @@ def build_entity_graph(
     graph = nx.Graph()
 
     for entity in entities:
-        graph.add_node(str(entity["id"]), name=entity.get("name", ""), type=entity.get("type", ""))
+        graph.add_node(
+            str(entity["id"]),
+            name=entity.get("name", ""),
+            type=entity.get("type", ""),
+        )
 
     for rel in relationships:
         source = str(rel.get("source_id", ""))
@@ -55,7 +61,7 @@ def build_entity_graph(
             graph.add_edge(
                 source,
                 target,
-                type=rel.get("relationship_type", ""),
+                type=rel.get("type", rel.get("relationship_type", "")),
             )
 
     return graph

@@ -10,8 +10,18 @@ tests exercise the real middleware gates
 (``require_project_membership``, ``require_permission[_or_self]``) with
 real cross-org UUIDs.  No new container infrastructure — isolation comes
 from the ``isolated_app`` table-truncation teardown.
+
+.. note::
+
+    ``pytest_plugins`` is **not** defined here because pytest 9 no longer
+    supports declaring plugins inside a non-top-level conftest.  Security
+    tests that need integration fixtures import them explicitly from
+    ``tests.integration.conftest``.
 """
 
+# F811: the integration fixtures re-exported below are also requested as
+# parameters by the fixtures in this module — same name, no real collision.
+# ruff: noqa: F811
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -19,12 +29,17 @@ from typing import TYPE_CHECKING, Any
 import pytest_asyncio
 from httpx import AsyncClient
 
-from tests.integration.conftest import asgi_transport, bootstrap_tenant
+from tests.integration.conftest import (  # noqa: F401  (fixtures are re-exported)
+    asgi_transport,
+    bootstrap_tenant,
+    db_session,
+    engine,
+    isolated_app,
+    redis_client,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
-
-pytest_plugins = ("tests.integration.conftest",)
 
 
 @pytest_asyncio.fixture(loop_scope="function")

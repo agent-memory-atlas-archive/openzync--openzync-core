@@ -8,6 +8,7 @@ for tenant isolation.
 from __future__ import annotations
 
 import logging
+from typing import Any
 from uuid import UUID
 
 from core.exceptions import NotFoundError, ValidationError
@@ -21,6 +22,7 @@ from schemas.projects import (
     ProjectResponse,
     UpdateProjectRequest,
 )
+from schemas.users import UserResponse
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +77,10 @@ class ProjectService:
         )
         if existing is not None:
             raise ValidationError(
-                message=f"A project named '{payload.name}' already exists in this organisation",
+                message=(
+                    f"A project named '{payload.name}' already exists "
+                    "in this organisation"
+                ),
                 detail={"name": payload.name},
             )
 
@@ -152,15 +157,21 @@ class ProjectService:
         offset: int = 0,
         pinned_only: bool = False,
         sort: SortSpec | None = None,
+        include_archived: bool = False,
     ) -> list[ProjectResponse]:
-        """List non-archived projects in an organisation.
+        """List projects in an organisation.
 
         When ``user_id`` is provided, only projects where the user is a
         member are returned.  When ``user_id`` is ``None`` (API key auth),
-        all non-archived projects in the org are returned with
+        all projects in the org are returned with
         ``is_pinned=False``.  Each entry carries ``is_pinned`` for the
         requesting user; ``pinned_only=True`` returns just their pins,
         most recently pinned first.
+
+        Archived projects are excluded by default; pass
+        ``include_archived=True`` to include them.  The ``pinned_only``
+        branch always excludes archived projects — archiving deletes a
+        project's pins, so no archived project can be pinned.
 
         Default ``created_at/desc`` (``pinned_at/desc`` for pinned_only);
         whitelist ``name``, ``created_at``, ``updated_at`` (plus
@@ -174,6 +185,7 @@ class ProjectService:
             offset: Number of results to skip.
             pinned_only: Return only the user's pinned projects.
             sort: Validated sort spec (forwarded opaque to the repository).
+            include_archived: If ``True``, include archived projects.
 
         Raises:
             ValidationError: If ``pinned_only`` is set without a user
@@ -219,6 +231,7 @@ class ProjectService:
             limit=limit,
             offset=offset,
             sort=sort,
+            include_archived=include_archived,
         )
         # Batch-load member counts for all projects in a single query
         project_ids = [p.id for p in projects]
@@ -231,6 +244,7 @@ class ProjectService:
                 created_by=p.created_by,
                 member_count=counts.get(p.id, 0),
                 is_pinned=(p.id in pinned_ids),
+                is_archived=p.is_archived,
                 created_at=p.created_at,
                 updated_at=p.updated_at,
             )
@@ -313,6 +327,53 @@ class ProjectService:
                 "project_id": str(project_id),
                 "pins_removed": freed,
             },
+        )
+
+    async def unarchive_project(
+        self,
+        organization_id: UUID,
+        project_id: UUID,
+    ) -> ProjectResponse:
+        """Restore an archived project.
+
+        The repository fetches via a direct select including archived
+        rows — ``get_by_id`` 404s archived projects so it cannot be
+        used here.
+
+        Args:
+            organization_id: Tenant scope.
+            project_id: The project to restore.
+
+        Returns:
+            The restored ProjectResponse.
+
+        Raises:
+            NotFoundError: If the project does not exist.
+        """
+        project = await self._repo.unarchive(organization_id, project_id)
+        if project is None:
+            raise NotFoundError(
+                message=f"Project {project_id} not found",
+                detail={"project_id": str(project_id)},
+            )
+
+        member_count = await self._repo.count_members(project_id)
+        logger.info(
+            "project_service.project_unarchived",
+            extra={
+                "org_id": str(organization_id),
+                "project_id": str(project_id),
+            },
+        )
+        return ProjectResponse(
+            id=project.id,
+            name=project.name,
+            description=project.description or "",
+            created_by=project.created_by,
+            member_count=member_count,
+            is_archived=project.is_archived,
+            created_at=project.created_at,
+            updated_at=project.updated_at,
         )
 
     # ── Pins ──────────────────────────────────────────────────────────────────
@@ -461,7 +522,9 @@ class ProjectService:
         member = await self._repo.get_member(project_id, user_id)
         if member is None:
             raise NotFoundError(
-                message=f"Membership not found for user {user_id} in project {project_id}",
+                message=(
+                    f"Membership not found for user {user_id} in project {project_id}"
+                ),
                 detail={"user_id": str(user_id), "project_id": str(project_id)},
             )
 
@@ -493,9 +556,18 @@ class ProjectService:
         project_id: UUID,
         sort: SortSpec | None = None,
     ) -> list[ProjectMemberResponse]:
-        """List all members of a project.
+        """List all members of a project with nested user details.
 
-        Default ``created_at/asc``; whitelist ``created_at``, ``role``.
+        Default ``created_at/asc``; whitelist ``created_at``, ``role``,
+        ``name``, ``email``.
+
+        Args:
+            project_id: The project's UUID.
+            sort: Validated sort spec (forwarded opaque to the repository).
+
+        Returns:
+            Memberships with ``user`` populated, or ``None`` when the
+            user row is missing.
         """
         members = await self._repo.list_members(project_id, sort=sort)
         return [
@@ -505,9 +577,35 @@ class ProjectService:
                 user_id=m.user_id,
                 role=m.role,
                 created_at=m.created_at,
+                user=self._to_user_response(m.user) if m.user is not None else None,
             )
             for m in members
         ]
+
+    @staticmethod
+    def _to_user_response(user: Any) -> UserResponse:
+        """Map a User ORM row to UserResponse without touching ``User.metadata``.
+
+        ``metadata`` is reserved on ``DeclarativeBase`` — the real column
+        lives on ``metadata_`` — so ``model_validate(orm)`` reads
+        ``MetaData()`` and 500s. Mirrors ``UserService._user_to_dict``.
+        """
+        return UserResponse.model_validate(
+            {
+                "id": user.id,
+                "organization_id": user.organization_id,
+                "external_id": user.external_id,
+                "name": user.name,
+                "email": user.email,
+                "metadata": dict(user.metadata_) if user.metadata_ else {},
+                "role": user.role,
+                "permissions": list(user.permissions or []),
+                "is_deleted": user.is_deleted,
+                "is_pending_invite": user.invite_token_hash is not None,
+                "created_at": user.created_at,
+                "updated_at": user.updated_at,
+            }
+        )
 
     async def update_member_role(
         self,

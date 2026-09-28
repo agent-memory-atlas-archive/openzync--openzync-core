@@ -42,9 +42,6 @@ logger = logging.getLogger(__name__)
 COMMUNITY_MIN_ENTITY_COUNT = 5
 """Minimum entities required for community detection to run for a project."""
 
-PROMPT_NAME = "summarise_community_v1"
-"""Name of the Jinja2 prompt template for community summarisation."""
-
 
 async def summarise_community(ctx: dict, org_id: str | None = None) -> dict:
     """ARQ worker: run community detection and summarisation.
@@ -210,7 +207,7 @@ async def _process_org(ctx: dict, db: AsyncSession, org_id: UUID) -> int:
 
         for project_id in project_ids:
             try:
-                # 1. Fetch all entities (non-community) via backend
+                # 1. Fetch all entities via backend
                 entities = await backend.get_all_entities(org_id, project_id)
 
                 if len(entities) < COMMUNITY_MIN_ENTITY_COUNT:
@@ -225,12 +222,35 @@ async def _process_org(ctx: dict, db: AsyncSession, org_id: UUID) -> int:
                     continue
 
                 # 2. Fetch relationships via backend
-                relationships = await backend.get_all_relationships(
-                    org_id, project_id
+                relationships = await backend.get_all_relationships(org_id, project_id)
+
+                # 3. Exclude prior-run artefacts from the detection input
+                # so reruns cannot drag clustering toward old communities.
+                # Cross-backend contract: entity dicts carry "type"
+                # (primary) with "entity_type" as fallback for future
+                # backends; relationship dicts carry "type".
+                input_entities = [
+                    e
+                    for e in entities
+                    if e.get("type", e.get("entity_type", "")) != "community"
+                ]
+                input_relationships = [
+                    r
+                    for r in relationships
+                    if r.get("type", r.get("relationship_type", "")) != "member_of"
+                ]
+                logger.info(
+                    "community.feedback_excluded",
+                    extra={
+                        "org_id": str(org_id),
+                        "project_id": str(project_id),
+                        "excluded_nodes": len(entities) - len(input_entities),
+                        "excluded_edges": len(relationships) - len(input_relationships),
+                    },
                 )
 
-                # 3. Build graph and detect communities
-                graph = build_entity_graph(entities, relationships)
+                # 4. Build graph and detect communities
+                graph = build_entity_graph(input_entities, input_relationships)
                 communities = detect_communities_label_propagation(graph)
 
                 if not communities:
@@ -243,7 +263,12 @@ async def _process_org(ctx: dict, db: AsyncSession, org_id: UUID) -> int:
                     )
                     continue
 
-                # 4. Generate summaries and store
+                # 5. Rerun idempotency: delete prior-run communities
+                # before storing fresh ones so reruns replace instead of
+                # duplicating.
+                await _delete_prior_communities(backend, org_id, project_id)
+
+                # 6. Generate summaries and store
                 for community_nodes in communities:
                     try:
                         await _create_community(
@@ -293,6 +318,65 @@ async def _process_org(ctx: dict, db: AsyncSession, org_id: UUID) -> int:
     return total_created
 
 
+async def _delete_prior_communities(
+    backend: GraphBackend,
+    org_id: UUID,
+    project_id: UUID,
+) -> int:
+    """Delete prior-run community nodes for a project.
+
+    Makes reruns idempotent: fresh communities replace prior ones instead
+    of duplicating them. IDs are collected before deleting so cursor
+    pagination cannot skip rows over the mutating list.
+
+    Postgres cascades incident edges via FK and FalkorDB uses ``DETACH
+    DELETE``. SurrealDB ``delete_entity`` removes only the node record —
+    native ``RELATE`` edge-table rows may survive as orphans.
+
+    Args:
+        backend: Initialised graph backend for this org.
+        org_id: Organization UUID.
+        project_id: Project UUID.
+
+    Returns:
+        Number of prior community nodes deleted. Note: on SurrealDB,
+        incident ``member_of`` edges may survive as orphans (no new
+        interface method added — see ``GraphBackend.delete_entity``).
+    """
+    community_ids: list[UUID] = []
+    cursor: str | None = None
+    while True:
+        page = await backend.list_entities(
+            org_id,
+            project_id,
+            entity_type="community",
+            limit=200,
+            cursor=cursor,
+        )
+        for item in page.get("items", []):
+            if item.get("id") is None:
+                continue
+            community_ids.append(UUID(str(item["id"])))
+        cursor = page.get("next_cursor")
+        if not page.get("has_more") or not cursor:
+            break
+
+    deleted = 0
+    for community_id in community_ids:
+        if await backend.delete_entity(org_id, project_id, community_id):
+            deleted += 1
+
+    logger.info(
+        "community.prior_communities_deleted",
+        extra={
+            "org_id": str(org_id),
+            "project_id": str(project_id),
+            "deleted": deleted,
+        },
+    )
+    return deleted
+
+
 async def _create_community(
     ctx: dict,
     backend: GraphBackend,
@@ -326,9 +410,7 @@ async def _create_community(
 
     # Build entity name map
     entity_map = {e["id"]: e for e in all_entities}
-    member_names = [
-        entity_map[eid]["name"] for eid in entity_ids if eid in entity_map
-    ]
+    member_names = [entity_map[eid]["name"] for eid in entity_ids if eid in entity_map]
     community_name = (
         f"Community: {', '.join(member_names[:3])}"
         f"{'...' if len(member_names) > 3 else ''}"
@@ -339,7 +421,7 @@ async def _create_community(
     context_rels = [
         r
         for r in all_relationships
-        if r["source_id"] in entity_ids and r["target_id"] in entity_ids
+        if r.get("source_id") in entity_ids and r.get("target_id") in entity_ids
     ]
 
     # Generate summary via LLM
@@ -347,9 +429,7 @@ async def _create_community(
         prompt = _build_community_prompt(context_entities, context_rels)
         bao_client = ctx.get("openbao_client") if isinstance(ctx, dict) else None
         if bao_client is not None:
-            org_cfg = await get_org_config(
-                org_id, redis=None, bao_client=bao_client
-            )
+            org_cfg = await get_org_config(org_id, redis=None, bao_client=bao_client)
         else:
             from core.config import BootstrapSettings
             from core.openbao import OpenBaoClient
@@ -361,9 +441,7 @@ async def _create_community(
                 bootstrap.OPENBAO_SECRET_ID,
                 timeout=10.0,
             ) as _tmp_bao:
-                org_cfg = await get_org_config(
-                    org_id, redis=None, bao_client=_tmp_bao
-                )
+                org_cfg = await get_org_config(org_id, redis=None, bao_client=_tmp_bao)
         llm_config_dict = org_cfg.to_llm_config_dict()
         llm = await resolve_llm_backend(org_config=llm_config_dict)
         start = time.monotonic()
@@ -386,8 +464,7 @@ async def _create_community(
             extra={"error": str(exc)},
         )
         summary = (
-            f"Community of {len(member_names)} entities: "
-            f"{', '.join(member_names)}"
+            f"Community of {len(member_names)} entities: {', '.join(member_names)}"
         )
     else:
         # Chat succeeded — record usage in the shared session (commits with
@@ -464,7 +541,8 @@ def _build_community_prompt(
     for e in entities:
         parts.append(
             "- {} ({}): {}".format(
-                e.get("name", "?"), e.get("type", "?"),
+                e.get("name", "?"),
+                e.get("type", "?"),
                 e.get("summary", "")[:100],
             )
         )
@@ -480,7 +558,7 @@ def _build_community_prompt(
                 (e["name"] for e in entities if e["id"] == r["target_id"]),
                 r["target_id"][:8],
             )
-            parts.append(f"- {src_name} --[{r['relationship_type']}]--> {tgt_name}")
+            parts.append(f"- {src_name} --[{r.get('type', '?')}]--> {tgt_name}")
 
     parts.extend(["", "Summary:"])
     return "\n".join(parts)

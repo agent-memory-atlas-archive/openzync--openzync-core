@@ -19,7 +19,9 @@ Strategy:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -35,9 +37,7 @@ from workers.tasks.base import ENRICHMENT_EMBEDDING, ENRICHMENT_ENTITIES
 pytestmark = pytest.mark.slow
 
 
-def _set_test_env_vars(
-    pg_url: str, redis_host: str, redis_port: int
-) -> None:
+def _set_test_env_vars(pg_url: str, redis_host: str, redis_port: int) -> None:
     """Set environment variables so the app connects to test containers.
 
     Args:
@@ -64,7 +64,10 @@ async def pipeline_app(engine) -> tuple[Any, str, int]:
     assert pg_container is not None, "Testcontainers PG not found on engine"
     assert redis_container is not None, "Testcontainers Redis not found on engine"
 
-    pg_url = str(engine.url).replace("postgresql+asyncpg://", "postgresql://")
+    # The dead bare-``postgresql://`` URL that used to live here is gone: the
+    # async URL below is the only one consumed, and a bare scheme would have
+    # inherited SQLAlchemy's default sync dialect. Use ``sync_database_url``
+    # from ``tests.conftest`` if a sync engine is ever needed here.
     asyncpg_url = str(engine.url)
     redis_host = redis_container.get_container_host_ip()
     redis_port = redis_container.get_exposed_port(6379)
@@ -75,6 +78,7 @@ async def pipeline_app(engine) -> tuple[Any, str, int]:
     import importlib
 
     import core.config
+
     importlib.reload(core.config)
 
     # Create the app — lifespan will init ARQ against test Redis
@@ -194,7 +198,8 @@ class TestEnrichmentPipeline:
                         Episode.id,
                         Episode.enrichment_status,
                         Episode.embedding,
-                    ).where(
+                    )
+                    .where(
                         Episode.user_id == user_id,
                         Episode.is_deleted.is_(False),
                     )
@@ -252,9 +257,7 @@ class TestEnrichmentPipeline:
             f"Episode statuses: {statuses}"
         )
 
-    async def _check_graph_entities(
-        self, engine: Any, user_id: UUID
-    ) -> list[dict]:
+    async def _check_graph_entities(self, engine: Any, user_id: UUID) -> list[dict]:
         """Query the graph backend for entities belonging to this user.
 
         Args:
@@ -275,10 +278,7 @@ class TestEnrichmentPipeline:
                 {"user_id": user_id},
             )
             rows = result.all()
-            return [
-                {"id": str(r[0]), "name": r[1], "type": r[2]}
-                for r in rows
-            ]
+            return [{"id": str(r[0]), "name": r[1], "type": r[2]} for r in rows]
 
     # ── Tests ──────────────────────────────────────────────────────────────
 
@@ -307,9 +307,7 @@ class TestEnrichmentPipeline:
         user_id = user_resp.json()["id"]
 
         # ── Step 2: Start the ARQ worker in background ─────────────────
-        worker_instance, worker_task = await self._start_worker(
-            redis_host, redis_port
-        )
+        worker_instance, worker_task = await self._start_worker(redis_host, redis_port)
         try:
             # ── Step 3: Ingest a conversation (10 turns) ──────────────────
             flat_messages: list[dict] = []
@@ -336,9 +334,7 @@ class TestEnrichmentPipeline:
             )
 
             # ── Step 4: Poll for enrichment completion ─────────────────
-            episodes = await self._poll_episode_enrichment(
-                engine, UUID(user_id)
-            )
+            episodes = await self._poll_episode_enrichment(engine, UUID(user_id))
 
             # G1.3: All episodes must have non-NULL embedding
             for ep in episodes:
@@ -367,8 +363,10 @@ class TestEnrichmentPipeline:
 
         finally:
             # ── Step 5: Clean up worker ────────────────────────────────
+            # Teardown swallows the worker's own failure: the assertions
+            # above already decided the test's outcome, and re-raising from
+            # a ``finally`` would mask it.  ``contextlib.suppress`` keeps the
+            # original ``(CancelledError, Exception)`` catch set verbatim.
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await worker_task
-            except (asyncio.CancelledError, Exception):
-                pass

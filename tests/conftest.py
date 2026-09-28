@@ -41,7 +41,9 @@ def _start_postgres_container() -> object:
     container = PostgresContainer(
         image="pgvector/pgvector:pg15",
         username="openzync",
-        password="openzync",
+        # Disposable credential for a throwaway testcontainer that lives only
+        # for the duration of the test session — not a real secret.
+        password="openzync",  # noqa: S106
         dbname="openzync_test",
         driver="asyncpg",
     )
@@ -85,6 +87,23 @@ def _start_falkordb_container() -> object:
     return container
 
 
+def sync_database_url(url: str) -> str:
+    """Force the psycopg2 dialect on a sync database URL.
+
+    SQLAlchemy 2.1 changed the default ``postgresql://`` dialect from
+    psycopg2 to psycopg (v3). ``psycopg2-binary`` is the declared dev
+    dependency, so the driver must be pinned explicitly instead of
+    inherited from whatever the installed SQLAlchemy defaults to.
+
+    Accepts either scheme: a ``postgresql+asyncpg://`` URL (what
+    ``testcontainers`` hands out) or a bare ``postgresql://`` one.
+    Already-pinned URLs are returned unchanged.
+    """
+    return url.replace("postgresql+asyncpg://", "postgresql+psycopg2://").replace(
+        "postgresql://", "postgresql+psycopg2://"
+    )
+
+
 def _run_alembic_upgrade(driver_url: str) -> None:
     """Run Alembic migrations up to ``head`` against the given database.
 
@@ -97,7 +116,7 @@ def _run_alembic_upgrade(driver_url: str) -> None:
     from sqlalchemy import create_engine
 
     # Alembic needs a sync engine for its migration runner
-    sync_url = driver_url.replace("postgresql+asyncpg://", "postgresql://")
+    sync_url = sync_database_url(driver_url)
     sync_engine = create_engine(sync_url, pool_pre_ping=True)
 
     try:

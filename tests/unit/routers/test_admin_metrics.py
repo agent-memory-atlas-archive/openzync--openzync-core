@@ -5,6 +5,8 @@ Tests ``/metrics/summary``, ``/metrics/query``, and ``/metrics/targets``.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
@@ -28,6 +30,11 @@ USER_ID = UUID("00000000-0000-0000-0000-000000000002")
 PROJECT_ID = UUID("00000000-0000-0000-0000-000000000003")
 
 
+def _within(*, hours: int) -> str:
+    """ISO timestamp *hours* in the past — shapes the 24h entity window."""
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
+
 @pytest.fixture(autouse=True)
 def _stub_permission_gate() -> None:
     """Stub the permission gate for every test in this file.
@@ -49,6 +56,16 @@ def _create_app() -> tuple[FastAPI, AsyncMock]:
     db_mock = AsyncMock(spec=AsyncSession)
     # Ensure execute() returns a sync mock so scalar() yields values, not coroutines
     db_mock.execute.return_value = MagicMock()
+    # /metrics/summary and /metrics/query depend on dependencies.org_config,
+    # which reads app.state.openbao_client + app.state.redis and raises
+    # OpenBaoConnectionError when the client is missing (core/org_config.py:101).
+    # Same app.state wiring as test_admin_gate_matrix / test_admin_system;
+    # an empty stored config (read_org_config -> {}) resolves to the
+    # OrgConfigBase defaults (graph_backend="falkordb").
+    app.state.openbao_client = AsyncMock()
+    app.state.openbao_client.read_org_config = AsyncMock(return_value={})
+    app.state.redis = AsyncMock()
+    app.state.redis.get = AsyncMock(return_value=None)
 
     @app.middleware("http")
     async def _mock_auth(request, call_next):
@@ -74,11 +91,34 @@ async def test_get_metrics_summary_success() -> None:
     app, db_mock = _create_app()
     transport = ASGITransport(app=app)
 
-    # Mock DB scalar results — _fetch_db_counts calls scalar() 9 times.
-    # Each call gets the next value: episodes (6), graph entities (2), users (1).
+    # Mock DB scalar results — _fetch_db_counts calls scalar() 7 times:
+    # episodes (6), users (1).  Graph entity counts no longer come from SQL
+    # (GraphStatsService reads the graph backend, not the never-written
+    # graph_entities PG stub), so they are driven by the fake backend below.
     # All execute() calls return the same MagicMock (set in _create_app), so
     # scalar.side_effect on the shared return_value distributes values in order.
-    db_mock.execute.return_value.scalar.side_effect = [42, 10, 5, 2, 35, 30, 100, 5, 3]
+    db_mock.execute.return_value.scalar.side_effect = [42, 10, 5, 2, 35, 30, 3]
+
+    # Project scope: GraphStatsService.resolve_project_ids pages through
+    # ProjectRepository.list() — one project here, so the backend is fanned
+    # out over exactly that project.
+    db_mock.execute.return_value.scalars.return_value.all.return_value = [
+        SimpleNamespace(id=PROJECT_ID)
+    ]
+
+    # Graph backend: 100 entities, 5 created within the last 24h.
+    # resolve_and_create is a SYNC factory (core/graph_backend.py:98).
+    backend = AsyncMock()
+    app.state.graph_backend_dispatcher = MagicMock()
+    app.state.graph_backend_dispatcher.resolve_and_create = MagicMock(
+        return_value=backend
+    )
+    backend.get_all_entities = AsyncMock(
+        return_value=[
+            {"id": f"e{i}", "created_at": _within(hours=1 if i < 5 else 48)}
+            for i in range(100)
+        ]
+    )
 
     # Mock MetricsService via its dependency factory
     mock_metrics = AsyncMock()
@@ -157,14 +197,20 @@ async def test_get_org_query_success() -> None:
 
     # Mock DB result for episodes_per_day query — returns rows via scalars()
     mock_result = MagicMock()
-    mock_result.__iter__ = MagicMock(return_value=iter([
-        MagicMock(date="2026-08-18", count=42),
-        MagicMock(date="2026-08-17", count=38),
-    ]))
+    mock_result.__iter__ = MagicMock(
+        return_value=iter(
+            [
+                MagicMock(date="2026-08-18", count=42),
+                MagicMock(date="2026-08-17", count=38),
+            ]
+        )
+    )
     db_mock.execute.return_value = mock_result
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/metrics/query", params={"query": "episodes_per_day", "days": 7})
+        resp = await client.get(
+            "/metrics/query", params={"query": "episodes_per_day", "days": 7}
+        )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -203,9 +249,7 @@ async def test_get_org_query_invalid_project_id_returns_422() -> None:
     assert resp.status_code == 422
     # FastAPI's request-validation payload names the offending query param.
     errors = resp.json()["detail"]
-    assert any(
-        err.get("loc") == ["query", "project_id"] for err in errors
-    ), errors
+    assert any(err.get("loc") == ["query", "project_id"] for err in errors), errors
 
 
 @pytest.mark.asyncio
@@ -216,9 +260,13 @@ async def test_get_org_query_with_valid_project_id_returns_200() -> None:
 
     # Same row shape as test_get_org_query_success — handler iterates `result`.
     mock_result = MagicMock()
-    mock_result.__iter__ = MagicMock(return_value=iter([
-        MagicMock(date="2026-08-18", count=42),
-    ]))
+    mock_result.__iter__ = MagicMock(
+        return_value=iter(
+            [
+                MagicMock(date="2026-08-18", count=42),
+            ]
+        )
+    )
     db_mock.execute.return_value = mock_result
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:

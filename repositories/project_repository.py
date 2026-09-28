@@ -10,10 +10,12 @@ from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import contains_eager
 
 from core.sorting import SortSpec, resolve_order_by
 from models.project import Project
 from models.project_member import ProjectMember
+from models.user import User
 
 PROJECT_SORTABLE_COLUMNS = {
     "name": Project.name,
@@ -25,6 +27,8 @@ PROJECT_SORTABLE_COLUMNS = {
 PROJECT_MEMBER_SORTABLE_COLUMNS = {
     "created_at": ProjectMember.created_at,
     "role": ProjectMember.role,
+    "name": User.name,
+    "email": User.email,
 }
 """Sortable columns for project members (default created_at/asc)."""
 
@@ -95,9 +99,7 @@ class ProjectRepository:
         )
         return result.scalar_one_or_none()
 
-    async def get_by_name(
-        self, organization_id: UUID, name: str
-    ) -> Project | None:
+    async def get_by_name(self, organization_id: UUID, name: str) -> Project | None:
         """Look up a project by name within an organisation.
 
         Args:
@@ -116,9 +118,7 @@ class ProjectRepository:
         )
         return result.scalar_one_or_none()
 
-    async def is_archived(
-        self, organization_id: UUID, project_id: UUID
-    ) -> bool:
+    async def is_archived(self, organization_id: UUID, project_id: UUID) -> bool:
         """Check whether a project is archived (or missing).
 
         Single-column SELECT scoped to the org. Fail-closed: returns
@@ -155,12 +155,16 @@ class ProjectRepository:
         limit: int = 50,
         offset: int = 0,
         sort: SortSpec | None = None,
+        include_archived: bool = False,
     ) -> list[Project]:
-        """List non-archived projects in an organisation.
+        """List projects in an organisation.
 
         When ``user_id`` is provided, only projects where that user is a
         member are returned.  When ``user_id`` is ``None`` (API key auth),
-        all non-archived projects in the org are returned.
+        all projects in the org are returned.
+
+        Archived projects are excluded by default; pass
+        ``include_archived=True`` to include them.
 
         Default ``created_at/desc``; whitelist ``name``, ``created_at``,
         ``updated_at``.
@@ -172,6 +176,7 @@ class ProjectRepository:
             limit: Maximum results per page (capped at 200).
             offset: Number of results to skip.
             sort: Validated sort spec.
+            include_archived: If ``True``, include archived projects.
 
         Returns:
             A list of Project ORM instances.
@@ -182,19 +187,17 @@ class ProjectRepository:
 
         query = select(Project).where(
             Project.organization_id == organization_id,
-            Project.is_archived.is_(False),
         )
+        if not include_archived:
+            query = query.where(Project.is_archived.is_(False))
 
         if user_id is not None:
-            query = (
-                query
-                .join(ProjectMember, Project.id == ProjectMember.project_id)
-                .where(ProjectMember.user_id == user_id)
-            )
+            query = query.join(
+                ProjectMember, Project.id == ProjectMember.project_id
+            ).where(ProjectMember.user_id == user_id)
 
         result = await self._db.execute(
-            query
-            .order_by(
+            query.order_by(
                 *resolve_order_by(
                     PROJECT_SORTABLE_COLUMNS,
                     Project.id,
@@ -240,9 +243,7 @@ class ProjectRepository:
         await self._db.refresh(project)
         return project
 
-    async def archive(
-        self, organization_id: UUID, project_id: UUID
-    ) -> Project | None:
+    async def archive(self, organization_id: UUID, project_id: UUID) -> Project | None:
         """Soft-delete (archive) a project.
 
         All sessions and entities remain in the database but the project
@@ -260,6 +261,36 @@ class ProjectRepository:
             return None
 
         project.is_archived = True
+        await self._db.flush()
+        await self._db.refresh(project)
+        return project
+
+    async def unarchive(
+        self, organization_id: UUID, project_id: UUID
+    ) -> Project | None:
+        """Restore an archived project (set ``is_archived=False``).
+
+        Uses a direct select including archived rows — ``get_by_id``
+        404s archived projects so it cannot be used here.
+
+        Args:
+            organization_id: Tenant scope.
+            project_id: The project's UUID.
+
+        Returns:
+            The unarchived Project, or ``None`` if not found.
+        """
+        result = await self._db.execute(
+            select(Project).where(
+                Project.id == project_id,
+                Project.organization_id == organization_id,
+            )
+        )
+        project = result.scalar_one_or_none()
+        if project is None:
+            return None
+
+        project.is_archived = False
         await self._db.flush()
         await self._db.refresh(project)
         return project
@@ -313,9 +344,7 @@ class ProjectRepository:
         await self._db.refresh(member)
         return member
 
-    async def remove_member(
-        self, project_id: UUID, user_id: UUID
-    ) -> bool:
+    async def remove_member(self, project_id: UUID, user_id: UUID) -> bool:
         """Remove a user from a project.
 
         Args:
@@ -338,9 +367,7 @@ class ProjectRepository:
         await self._db.flush()
         return True
 
-    async def get_member(
-        self, project_id: UUID, user_id: UUID
-    ) -> ProjectMember | None:
+    async def get_member(self, project_id: UUID, user_id: UUID) -> ProjectMember | None:
         """Check if a user is a member of a project and return their membership.
 
         Args:
@@ -359,24 +386,33 @@ class ProjectRepository:
         return result.scalar_one_or_none()
 
     async def list_members(
-        self, project_id: UUID,
+        self,
+        project_id: UUID,
         sort: SortSpec | None = None,
     ) -> list[ProjectMember]:
-        """List all members of a project.
+        """List all members of a project with users eagerly loaded.
 
-        Default ``created_at/asc``; whitelist ``created_at``, ``role``.
+        Single query: LEFT OUTER JOIN to users (no ``is_deleted`` filter,
+        so soft-deleted users still resolve; ``member.user`` is ``None``
+        only when the user row is truly missing) with ``contains_eager``,
+        so accessing ``member.user`` emits no further SQL (no N+1).
+
+        Default ``created_at/asc``; whitelist ``created_at``, ``role``,
+        ``name``, ``email`` (user fields sort on the joined row).
 
         Args:
             project_id: The project's UUID.
             sort: Validated sort spec.
 
         Returns:
-            A list of ProjectMember ORM instances.
+            A list of ProjectMember ORM instances with ``user`` populated.
         """
         spec = sort if sort is not None else SortSpec()
         req_sort, req_dir = spec.effective("created_at", "asc")
         result = await self._db.execute(
             select(ProjectMember)
+            .outerjoin(User, ProjectMember.user_id == User.id)
+            .options(contains_eager(ProjectMember.user))
             .where(ProjectMember.project_id == project_id)
             .order_by(
                 *resolve_order_by(

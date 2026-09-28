@@ -51,6 +51,8 @@ from uuid import UUID
 
 import pytest
 
+from core.embeddings import CANONICAL_EMBED_DIM
+
 if TYPE_CHECKING:
     from httpx import AsyncClient
 
@@ -122,7 +124,9 @@ async def _create_session(
 # ── Search fixtures (mirror tests/integration/test_search_facts.py) ───────
 # ``isolated_app`` does not run the lifespan, so the graph-backend
 # dispatcher must be wired manually; the vector leg needs a stubbed
-# embedding backend (zero vectors match the ``vector(1536)`` column).
+# embedding backend. The stub must return canonical-dim vectors — prod
+# ``validate_embedding_dim`` (core/embeddings.py) hard-rejects any other
+# length, so a stale literal here surfaces as a 503 ``search_leg_failed``.
 
 
 @dataclass
@@ -134,7 +138,9 @@ class _FakeEmbedBackend:
     async def embed(
         self, texts: list[str], model: str | None = None
     ) -> _FakeEmbedResponse:
-        return _FakeEmbedResponse(embeddings=[[0.0] * 1536 for _ in texts])
+        return _FakeEmbedResponse(
+            embeddings=[[0.0] * CANONICAL_EMBED_DIM for _ in texts]
+        )
 
 
 async def _fake_resolve_backend(

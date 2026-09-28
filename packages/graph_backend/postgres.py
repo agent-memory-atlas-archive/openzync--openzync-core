@@ -38,6 +38,7 @@ logger = structlog.get_logger(__name__)
 MAX_TRAVERSAL_DEPTH: int = 5
 """Hard cap on BFS depth to prevent unbounded recursive queries."""
 
+
 def _build_bfs_cte(*, temporal: bool) -> str:
     """Return the recursive BFS CTE, optionally temporally filtered.
 
@@ -72,6 +73,9 @@ def _build_bfs_cte(*, temporal: bool) -> str:
         )
     else:
         invalid_at_filter = "        AND r.invalid_at IS NULL\n"
+    # note: the only interpolated fragments are the two module-literal WHERE
+    # clauses selected by the ``temporal`` bool above — no caller-supplied value
+    # ever reaches the f-string. See the S608 noqa on the closing line.
     return f"""\
 WITH RECURSIVE bfs AS (
     -- Anchor: start node
@@ -105,7 +109,8 @@ SELECT DISTINCT ON (bfs.id) bfs.id, bfs.name, bfs.entity_type,
        bfs.summary, bfs.attributes, bfs.created_at, bfs.depth
 FROM bfs
 ORDER BY bfs.id, bfs.depth
-"""
+"""  # noqa: S608 — only {invalid_at_filter}/{temporal_filter}, module literals
+
 
 SEARCH_ENTITIES_SQL = """
 SELECT ge.id, ge.name, ge.entity_type, ge.summary,
@@ -432,7 +437,7 @@ class PostgresGraphBackend(GraphBackend):
                       AND project_id = :project_id
                     RETURNING id, name, entity_type, summary, attributes,
                               created_at, updated_at
-                    """
+                    """  # noqa: S608 — {set_clause} is ", ".join() over fixed literals
                 ),
                 updates,
             )
@@ -561,8 +566,13 @@ class PostgresGraphBackend(GraphBackend):
                         DO UPDATE SET
                             properties = CAST(:properties AS jsonb),
                             fact = :fact,
-                            confidence = GREATEST(graph_relationships.confidence, :confidence),
-                            valid_from = LEAST(graph_relationships.valid_from, COALESCE(:valid_from, now())),
+                            confidence = GREATEST(
+                                graph_relationships.confidence, :confidence
+                            ),
+                            valid_from = LEAST(
+                                graph_relationships.valid_from,
+                                COALESCE(:valid_from, now())
+                            ),
                             valid_to = CASE
                                 WHEN :valid_to IS NULL THEN NULL
                                 WHEN graph_relationships.valid_to IS NULL THEN NULL
@@ -580,7 +590,9 @@ class PostgresGraphBackend(GraphBackend):
                         "source_id": str(source_id),
                         "target_id": str(target_id),
                         "rel_type": relationship_type,
-                        "properties": orjson.dumps(properties if properties is not None else {}).decode("utf-8"),
+                        "properties": orjson.dumps(
+                            properties if properties is not None else {}
+                        ).decode("utf-8"),
                         "fact": "",
                         "confidence": confidence if confidence is not None else 1.0,
                         "valid_from": valid_from,
@@ -813,7 +825,7 @@ class PostgresGraphBackend(GraphBackend):
                     WHERE {conditions}
                     ORDER BY r.created_at DESC
                     LIMIT :limit
-                    """
+                    """  # noqa: S608 — {conditions} is a literal WHERE, values bound
                 ),
                 params,
             )
@@ -1006,7 +1018,8 @@ class PostgresGraphBackend(GraphBackend):
                     exc_info=True,
                 )
                 raise GraphBackendUnavailableError(
-                    f"PostgreSQL graph traversal neighbour fetch failed for entity {current_id}."
+                    "PostgreSQL graph traversal neighbour fetch failed "
+                    f"for entity {current_id}."
                 ) from exc
 
         return nodes
@@ -1133,13 +1146,15 @@ class PostgresGraphBackend(GraphBackend):
                 seen.add(entity_id_str)
 
                 # Add the matched entity itself with distance 0
-                results.append({
-                    "id": entity_id_str,
-                    "name": entity.get("name", ""),
-                    "type": entity.get("type", ""),
-                    "summary": entity.get("summary", ""),
-                    "distance": 0,
-                })
+                results.append(
+                    {
+                        "id": entity_id_str,
+                        "name": entity.get("name", ""),
+                        "type": entity.get("type", ""),
+                        "summary": entity.get("summary", ""),
+                        "distance": 0,
+                    }
+                )
 
                 # BFS up to max_depth
                 try:
@@ -1165,7 +1180,8 @@ class PostgresGraphBackend(GraphBackend):
                         exc_info=True,
                     )
                     raise GraphBackendUnavailableError(
-                        f"PostgreSQL graph traversal failed for entity {entity_id_str} during retrieve_graph."
+                        "PostgreSQL graph traversal failed for entity "
+                        f"{entity_id_str} during retrieve_graph."
                     ) from exc
 
                 for node in related:
@@ -1173,13 +1189,15 @@ class PostgresGraphBackend(GraphBackend):
                     depth = node.get("depth", 1)
                     if node_id and node_id not in seen:
                         seen.add(node_id)
-                        results.append({
-                            "id": node_id,
-                            "name": node.get("name", ""),
-                            "type": node.get("type", ""),
-                            "summary": node.get("summary", ""),
-                            "distance": depth,
-                        })
+                        results.append(
+                            {
+                                "id": node_id,
+                                "name": node.get("name", ""),
+                                "type": node.get("type", ""),
+                                "summary": node.get("summary", ""),
+                                "distance": depth,
+                            }
+                        )
 
             # Sort by distance (closest first), limit to max_results
             results.sort(key=lambda x: x.get("distance", 99))
@@ -1484,7 +1502,9 @@ class PostgresGraphBackend(GraphBackend):
                 },
             )
             raise ExternalServiceError(
-                message=f"Failed to link entity {entity_id} to episode {episode_id}: {exc}",
+                message=(
+                    f"Failed to link entity {entity_id} to episode {episode_id}: {exc}"
+                ),
                 detail={
                     "org_id": str(org_id),
                     "episode_id": str(episode_id),
@@ -1632,6 +1652,91 @@ class PostgresGraphBackend(GraphBackend):
                 },
             ) from exc
 
+    async def get_entities_for_episodes(
+        self,
+        org_id: UUID,
+        project_id: UUID,
+        episode_ids: list[UUID],
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return distinct graph entities linked to the given episodes.
+
+        Same return shape as :meth:`get_entities_for_session` — a list of
+        entity dicts with ``id``, ``name``, ``entity_type``, ``summary``
+        keys, capped at ``limit`` entries.
+
+        Joins the PG link tables directly by episode, mirroring
+        :meth:`get_entities_for_user` minus the user/session join.  The
+        caller resolves ``episode_ids`` (e.g. from the episodes table)
+        because session linkage lives outside the graph.  An empty
+        ``episode_ids`` list returns ``[]`` without touching the backend.
+
+        Args:
+            org_id: Organisational scope.
+            project_id: Project scope.
+            episode_ids: Episode UUIDs to scope the lookup to.
+            limit: Maximum entities to return (default 200, max 200).
+
+        Returns:
+            List of entity dicts with ``id``, ``name``, ``entity_type``,
+            ``summary`` keys.
+
+        Raises:
+            ExternalServiceError: If the lookup query fails.
+        """
+        if not episode_ids:
+            return []
+        limit = max(1, min(int(limit), 200))
+        try:
+            result = await self._db.execute(
+                text("""
+                    SELECT DISTINCT ge.id, ge.name, ge.entity_type, ge.summary
+                    FROM graph_entities ge
+                    JOIN graph_episode_entities gee ON ge.id = gee.entity_id
+                    JOIN episodes e ON e.id = gee.episode_id
+                    WHERE e.organization_id = :org_id
+                      AND ge.organization_id = :org_id
+                      AND ge.project_id = :project_id
+                      AND gee.episode_id IN :episode_ids
+                      AND e.is_deleted = false
+                      AND ge.is_merged = false
+                    LIMIT :limit
+                """).bindparams(bindparam("episode_ids", expanding=True)),
+                {
+                    "org_id": org_id,
+                    "project_id": project_id,
+                    "episode_ids": [str(e) for e in episode_ids],
+                    "limit": limit,
+                },
+            )
+            return [
+                {
+                    "id": str(row.id),
+                    "name": row.name,
+                    "entity_type": row.entity_type,
+                    "summary": row.summary if row.summary else "",
+                }
+                for row in result.all()
+            ]
+        except Exception as exc:
+            logger.error(
+                "pg_graph.get_entities_for_episodes_failed",
+                extra={
+                    "org_id": str(org_id),
+                    "project_id": str(project_id),
+                    "episode_count": len(episode_ids),
+                    "error": str(exc),
+                },
+            )
+            raise ExternalServiceError(
+                message=f"Failed to get entities for episodes: {exc}",
+                detail={
+                    "org_id": str(org_id),
+                    "episode_count": len(episode_ids),
+                },
+            ) from exc
+
     async def get_co_occurring_entity_pairs(
         self,
         org_id: UUID,
@@ -1700,6 +1805,21 @@ class PostgresGraphBackend(GraphBackend):
         *,
         include_merged: bool = False,
     ) -> list[dict[str, Any]]:
+        """List every entity in a project, ordered by name.
+
+        Merged entities are excluded unless ``include_merged`` is set.
+
+        Args:
+            org_id: Tenant scope.
+            project_id: Project scope.
+            include_merged: Include entities flagged as merged.
+
+        Returns:
+            List of entity dicts, ordered by name.
+
+        Raises:
+            ExternalServiceError: If the query fails.
+        """
         # ⚠️ BATCH USE ONLY — no pagination, no limit. Potentially millions of rows.
         try:
             result = await self._db.execute(
@@ -1724,8 +1844,12 @@ class PostgresGraphBackend(GraphBackend):
                     "name": row.name,
                     "entity_type": row.entity_type,
                     "summary": row.summary if row.summary else "",
-                    "is_merged": bool(row.is_merged) if hasattr(row, "is_merged") else False,
-                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "is_merged": (
+                        bool(row.is_merged) if hasattr(row, "is_merged") else False
+                    ),
+                    "created_at": (
+                        row.created_at.isoformat() if row.created_at else None
+                    ),
                 }
                 for row in result.all()
             ]
@@ -1748,6 +1872,18 @@ class PostgresGraphBackend(GraphBackend):
         org_id: UUID,
         project_id: UUID,
     ) -> list[dict[str, Any]]:
+        """List every active (non-invalidated) relationship in a project.
+
+        Args:
+            org_id: Tenant scope.
+            project_id: Project scope.
+
+        Returns:
+            List of relationship dicts, most recently created first.
+
+        Raises:
+            ExternalServiceError: If the query fails.
+        """
         # ⚠️ BATCH USE ONLY — no pagination, no limit. Potentially millions of rows.
         try:
             result = await self._db.execute(
@@ -1865,9 +2001,7 @@ class PostgresGraphBackend(GraphBackend):
         try:
             async with self._db.begin_nested():
                 # Set statement timeout for CTE-heavy operations
-                await self._db.execute(
-                    text("SET LOCAL statement_timeout = '10s'")
-                )
+                await self._db.execute(text("SET LOCAL statement_timeout = '10s'"))
 
                 # 1. Rewire relationships: source_id
                 src_result = await self._db.execute(
@@ -2026,7 +2160,9 @@ class PostgresGraphBackend(GraphBackend):
                             ON CONFLICT (source_id, target_id, relationship_type)
                             WHERE invalid_at IS NULL
                             DO UPDATE SET
-                                confidence = GREATEST(graph_relationships.confidence, :confidence),
+                                confidence = GREATEST(
+                                    graph_relationships.confidence, :confidence
+                                ),
                                 updated_at = now()
                             RETURNING id, source_id, target_id, relationship_type,
                                       properties, fact, confidence,
@@ -2109,8 +2245,10 @@ class PostgresGraphBackend(GraphBackend):
                     DO UPDATE SET
                         content = EXCLUDED.content,
                         confidence = EXCLUDED.confidence,
-                        supporting_fact_ids = EXCLUDED.supporting_fact_ids,
-                        supporting_relationship_ids = EXCLUDED.supporting_relationship_ids,
+                        supporting_fact_ids =
+                            EXCLUDED.supporting_fact_ids,
+                        supporting_relationship_ids =
+                            EXCLUDED.supporting_relationship_ids,
                         valid_from = EXCLUDED.valid_from,
                         valid_to = EXCLUDED.valid_to,
                         observation_metadata = EXCLUDED.observation_metadata,
@@ -2126,23 +2264,28 @@ class PostgresGraphBackend(GraphBackend):
                     "org_id": str(org_id),
                     "project_id": str(project_id),
                     "subject_entity_id": str(subject_entity_id),
-                    "related_entity_id": str(related_entity_id) if related_entity_id else None,
+                    "related_entity_id": (
+                        str(related_entity_id) if related_entity_id else None
+                    ),
                     "obs_type": observation_type,
                     "content": content,
                     "confidence": confidence,
                     "fact_ids": (
                         [str(fid) for fid in supporting_fact_ids]
-                        if supporting_fact_ids else None
+                        if supporting_fact_ids
+                        else None
                     ),
                     "rel_ids": (
                         [str(rid) for rid in supporting_relationship_ids]
-                        if supporting_relationship_ids else None
+                        if supporting_relationship_ids
+                        else None
                     ),
                     "valid_from": valid_from,
                     "valid_to": valid_to,
                     "obs_metadata": (
                         orjson.dumps(observation_metadata).decode()
-                        if observation_metadata else None
+                        if observation_metadata
+                        else None
                     ),
                 },
             )
@@ -2196,9 +2339,7 @@ class PostgresGraphBackend(GraphBackend):
             "asc",
         )
 
-        where_clause = (
-            "o.organization_id = :org_id AND o.project_id = :project_id"
-        )
+        where_clause = "o.organization_id = :org_id AND o.project_id = :project_id"
         params: dict[str, object] = {
             "org_id": org_id,
             "project_id": project_id,
@@ -2245,7 +2386,12 @@ class PostgresGraphBackend(GraphBackend):
                     WHERE {where_clause}
                     ORDER BY {order_col} {order_kw}, {tiebreak}
                     LIMIT :limit
-                """),
+                """),  # noqa: S608 — fragments are literals or whitelisted lookups
+                # note: {where_clause} is built from fixed ":name" predicates,
+                # {keyset} uses op = ">" or "<" from the validated asc/desc, and
+                # {order_col}/{order_kw}/{tiebreak} come from _resolve_graph_sort,
+                # which raises on any key outside OBSERVATION_SORTABLE_SQL. All
+                # values are bound via `params`.
                 params,
             )
             rows = result.all()
@@ -2272,7 +2418,9 @@ class PostgresGraphBackend(GraphBackend):
                 extra={
                     "org_id": str(org_id),
                     "project_id": str(project_id),
-                    "subject_entity_id": str(subject_entity_id) if subject_entity_id else None,
+                    "subject_entity_id": (
+                        str(subject_entity_id) if subject_entity_id else None
+                    ),
                     "observation_type": observation_type,
                     "error": str(exc),
                 },
@@ -2318,7 +2466,9 @@ class PostgresGraphBackend(GraphBackend):
                 },
             )
             raise ExternalServiceError(
-                message=f"Failed to get appearance timestamps for entity {entity_id}: {exc}",
+                message=(
+                    f"Failed to get appearance timestamps for entity {entity_id}: {exc}"
+                ),
                 detail={
                     "org_id": str(org_id),
                     "entity_id": str(entity_id),
@@ -2491,17 +2641,18 @@ class PostgresGraphBackend(GraphBackend):
             "confidence": float(row.confidence) if row.confidence is not None else 0.0,
             "supporting_fact_ids": (
                 [str(fid) for fid in row.supporting_fact_ids]
-                if row.supporting_fact_ids else []
+                if row.supporting_fact_ids
+                else []
             ),
             "supporting_relationship_ids": (
                 [str(rid) for rid in row.supporting_relationship_ids]
-                if row.supporting_relationship_ids else []
+                if row.supporting_relationship_ids
+                else []
             ),
             "valid_from": row.valid_from.isoformat() if row.valid_from else None,
             "valid_to": row.valid_to.isoformat() if row.valid_to else None,
             "observation_metadata": (
-                dict(row.observation_metadata)
-                if row.observation_metadata else {}
+                dict(row.observation_metadata) if row.observation_metadata else {}
             ),
             "created_at": row.created_at.isoformat() if row.created_at else None,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,

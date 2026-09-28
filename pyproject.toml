@@ -132,10 +132,33 @@ ignore = [
     "D203", # 1 blank line required before class docstring — conflicts with D211
     "D213", # multi-line summary should start at second line — conflicts with D212
     "S101", # allow assert in tests
+    # TYPE_CHECKING-block migration was attempted in 5a3b4b9 and reverted in
+    # d4fc0df. Re-attempting it is a deliberate, standalone change — not
+    # something to land piecemeal inside a feature PR.
+    "TC001",
+    "TC002",
+    "TC003",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# B008 flags function calls in argument defaults because a mutable default is
+# evaluated once at import. For FastAPI that is the dependency-injection
+# contract, not a bug: `Depends()`/`Query()`/`Path()` in defaults is how the
+# framework is meant to be used. This is ruff's documented opt-out.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Cookie",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+    "fastapi.Security",
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D", "S101"]
+"tests/**" = ["D", "S101", "E501"]
 "scripts/**" = ["D", "S101"]
 "core/config.py" = ["D"]
 
@@ -183,6 +206,13 @@ filterwarnings = [
     # httpx.AsyncClient) may leave transports unclosed after the event
     # loop shuts down.  This is cosmetic — no data loss or leak.
     "ignore::pytest.PytestUnraisableExceptionWarning",
+    # SQLAlchemy >=2.1 warns when a Computed column omits `persisted=`, because
+    # PG18+ would render VIRTUAL where <18 renders STORED. models/llm_usage.py
+    # now sets persisted=True explicitly, but migrations 0001/0004 also declare
+    # this column and must not be edited, so Alembic still emits the warning
+    # from the historical migration files. The DDL is already correct (every
+    # supported PG is <18, so it is STORED); only the emission is noisy.
+    "ignore:^Computed column:sqlalchemy.exc.SAWarning",
 ]
 markers = [
     "unit: Unit tests — no I/O, no DB, no network. Mock at the service boundary.",

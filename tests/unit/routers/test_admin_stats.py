@@ -68,6 +68,19 @@ class _MockDate:
         return self._date_str
 
 
+class _MockScalarsResult:
+    """Simulates a result supporting ``result.scalars().all()`` (ORM rows)."""
+
+    def __init__(self, rows: list | None = None) -> None:
+        self._rows = rows or []
+
+    def scalars(self) -> _MockScalarsResult:
+        return self
+
+    def all(self) -> list:
+        return self._rows
+
+
 class _MockStreamResult:
     """Simulates a SQLAlchemy result that supports iteration for stream results."""
 
@@ -97,6 +110,15 @@ def _build_app(mock_db: AsyncMock) -> FastAPI:
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[require_org_id] = lambda: str(ORG_ID)
     app.dependency_overrides[get_dashboard_user] = lambda: str(USER_ID)
+
+    # /usage depends on dependencies.org_config, which reads
+    # app.state.openbao_client + app.state.redis and raises
+    # OpenBaoConnectionError without a client (core/org_config.py:101).
+    # Same app.state wiring as test_admin_gate_matrix / test_admin_system.
+    app.state.openbao_client = AsyncMock()
+    app.state.openbao_client.read_org_config = AsyncMock(return_value={})
+    app.state.redis = AsyncMock()
+    app.state.redis.get = AsyncMock(return_value=None)
 
     @app.middleware("http")
     async def _mock_auth(request: Request, call_next):
@@ -216,7 +238,9 @@ class TestGetUsageStats:
         """Should return merged daily counts across all eight categories."""
         # The /usage endpoint runs 8 queries in sequence:
         #   episodes, sessions, facts, extractions, observations,
-        #   classifications, nodes, edges.
+        #   classifications, project-scope (GraphStatsService), edges.
+        # Node counts are NOT a query — they come from the graph backend's
+        # get_all_entities (the graph_entities PG stub is never written).
         # Each result is iterable (supports `for row in result`).
 
         class _IterResult:
@@ -239,7 +263,7 @@ class TestGetUsageStats:
             _IterResult([_MockRow("2026-07-28", 2)]),  # extractions
             _IterResult([_MockRow("2026-07-27", 4)]),  # observations
             _IterResult([]),  # classifications
-            _IterResult([_MockRow("2026-07-28", 1)]),  # nodes
+            _MockScalarsResult(),  # project scope — no projects in the org
             _IterResult(
                 [_MockRow("2026-07-28", 3), _MockRow("2026-07-27", 1)]
             ),  # edges
@@ -260,7 +284,10 @@ class TestGetUsageStats:
         assert day1["extraction_count"] == 2
         assert day1["observation_count"] == 0
         assert day1["classification_count"] == 0
-        assert day1["node_count"] == 1
+        # No graph_backend_dispatcher on app.state → admin_stats degrades to
+        # zero node counts (GraphStatsService.entity_counts_per_day returns
+        # {} for a None backend, services/graph_stats_service.py:130).
+        assert day1["node_count"] == 0
         assert day1["edge_count"] == 3
         assert day2["date"] == "2026-07-27"
         assert day2["episode_count"] == 15
@@ -288,12 +315,13 @@ class TestGetUsageStats:
             _IterResult([]),  # extractions
             _IterResult([]),  # observations
             _IterResult([]),  # classifications
-            _IterResult([]),  # nodes
+            _MockScalarsResult(),  # project scope
             _IterResult([]),  # edges
         ]
         response = await client.get("/v1/admin/stats/usage")
         assert response.status_code == 200
         assert response.json() == []
+        assert mock_db.execute.await_count == 8
 
     async def test_returns_422_on_invalid_days(
         self, client: AsyncClient, mock_db: AsyncMock

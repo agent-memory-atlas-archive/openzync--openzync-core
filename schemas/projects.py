@@ -13,6 +13,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from schemas.users import UserResponse
+
 # ── Type alias ─────────────────────────────────────────────────────────────────
 
 ProjectRole = Literal["owner", "member"]
@@ -159,12 +161,8 @@ class ProjectResponse(BaseModel):
         default=None,
         description="UUID of the creating user, or ``None`` if deleted.",
     )
-    created_at: datetime = Field(
-        ..., description="Project creation timestamp (UTC)."
-    )
-    updated_at: datetime = Field(
-        ..., description="Last modification timestamp (UTC)."
-    )
+    created_at: datetime = Field(..., description="Project creation timestamp (UTC).")
+    updated_at: datetime = Field(..., description="Last modification timestamp (UTC).")
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -202,12 +200,8 @@ class ProjectListResponse(BaseModel):
         default=None,
         description="UUID of the creating user, or ``None`` if deleted.",
     )
-    created_at: datetime = Field(
-        ..., description="Project creation timestamp (UTC)."
-    )
-    updated_at: datetime = Field(
-        ..., description="Last modification timestamp (UTC)."
-    )
+    created_at: datetime = Field(..., description="Project creation timestamp (UTC).")
+    updated_at: datetime = Field(..., description="Last modification timestamp (UTC).")
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -222,6 +216,8 @@ class ProjectMemberResponse(BaseModel):
         user_id: UUID of the user.
         role: Project role — ``"owner"`` or ``"member"``.
         created_at: Membership creation timestamp (UTC).
+        user: Nested user details, or ``None`` when the user row is
+            missing (deleted). Soft-deleted users still resolve.
     """
 
     id: UUID = Field(..., description="Membership record UUID.")
@@ -229,6 +225,10 @@ class ProjectMemberResponse(BaseModel):
     role: ProjectRole = Field(..., description="Project role: 'owner' or 'member'.")
     created_at: datetime = Field(
         ..., description="Membership creation timestamp (UTC)."
+    )
+    user: UserResponse | None = Field(
+        default=None,
+        description="Nested user details, or null when the user row is missing.",
     )
 
     model_config = ConfigDict(from_attributes=True)

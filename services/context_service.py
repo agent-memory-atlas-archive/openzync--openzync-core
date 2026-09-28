@@ -48,7 +48,6 @@ A fresh/bootstrap org has a ``None`` org config (or ``None``
 """
 
 
-
 def _preview(items: list[dict[str, Any]], max_chars: int = 500) -> str | None:
     """Build a compact preview string for the top result in a list.
 
@@ -72,7 +71,7 @@ def _preview(items: list[dict[str, Any]], max_chars: int = 500) -> str | None:
         for k in ("score", "rrf_score", "reranker_score")
         if (v := first.get(k)) is not None
     )
-    suffix = "..." if len(first.get("content") or "" ) > max_chars else ""
+    suffix = "..." if len(first.get("content") or "") > max_chars else ""
     if scores:
         return f"[{scores}] {content}{suffix}"
     return f"{content}{suffix}"
@@ -103,7 +102,11 @@ class ContextService:
         self._db = db
         reranker = RerankerFactory.create(org_config) if org_config else None
         self._retriever = HybridRetriever(
-            db, org_id, redis, graph_backends=graph_backends, org_config=org_config,
+            db,
+            org_id,
+            redis,
+            graph_backends=graph_backends,
+            org_config=org_config,
             reranker=reranker,
         )
         cache_ttl = (
@@ -111,11 +114,7 @@ class ContextService:
             if org_config is not None and org_config.context_cache_ttl is not None
             else DEFAULT_CONTEXT_CACHE_TTL
         )
-        self._cache = (
-            CacheService(redis, default_ttl=cache_ttl)
-            if redis
-            else None
-        )
+        self._cache = CacheService(redis, default_ttl=cache_ttl) if redis else None
         self._db = db
         self._org_id = org_id
         self._org_config = org_config
@@ -179,9 +178,9 @@ class ContextService:
             cached = await self._cache.get(cache_key)
             if cached is not None:
                 elapsed = (time.monotonic() - start) * 1000
-                context_latency_seconds.labels(type="warm", org_id=str(self._org_id)).observe(
-                    elapsed / 1000
-                )
+                context_latency_seconds.labels(
+                    type="warm", org_id=str(self._org_id)
+                ).observe(elapsed / 1000)
                 logger.debug(
                     "context.assembled",
                     org_id=str(self._org_id),
@@ -254,14 +253,16 @@ class ContextService:
                 if not blbs:
                     continue
                 urls: list[str | None] = (
-                    await asyncio.gather(*[
-                        BlobStorageService.generate_download_url(
-                            storage_key=bl.storage_key,
-                            storage_config=storage_config,
-                            expires_in=300,
-                        )
-                        for bl in blbs
-                    ])
+                    await asyncio.gather(
+                        *[
+                            BlobStorageService.generate_download_url(
+                                storage_key=bl.storage_key,
+                                storage_config=storage_config,
+                                expires_in=300,
+                            )
+                            for bl in blbs
+                        ]
+                    )
                     if storage_config
                     else [None] * len(blbs)
                 )
@@ -273,7 +274,11 @@ class ContextService:
                         "file_size": bl.file_size,
                         "download_url": url,
                     }
-                    for bl, url in zip(blbs, urls)
+                    # strict=True: ``urls`` is built one-per-blob above —
+                    # asyncio.gather over [.. for bl in blbs] returns exactly
+                    # len(blbs) results in order, and the fallback branch is
+                    # [None] * len(blbs). Lengths cannot diverge.
+                    for bl, url in zip(blbs, urls, strict=True)
                 ]
 
         # ═══════════════════════════════════════════════════════════════════
@@ -286,7 +291,7 @@ class ContextService:
                 results.get("entities", []),
                 results.get("communities", []),
             )
-            context_str: str = orjson.dumps(context_data).decode()
+            context_str: str = orjson.dumps(context_data, default=str).decode()
         else:
             context_str = format_text(
                 results.get("episodes", []),

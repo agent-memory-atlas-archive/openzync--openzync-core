@@ -1,4 +1,5 @@
 """Unit tests for generate_user_summary task."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,6 +10,12 @@ import pytest
 _ORG_ID = str(uuid4())
 _USER_ID = str(uuid4())
 _PROJECT_ID = str(uuid4())
+
+# ``generate_user_summary`` resolves the graph backend before rendering and
+# raises ``GraphBackendUnavailableError`` when it comes back None, so every
+# test needs a non-None backend in the worker context.
+_GRAPH_BACKEND_TARGET = "workers.backend.resolve_graph_backend"
+_GRAPH_BACKEND = MagicMock()
 
 
 @pytest.mark.unit
@@ -36,11 +43,20 @@ class TestGenerateUserSummary:
     async def test_success(self) -> None:
         """LLM generates summary from user data and persists it."""
         mock_llm = AsyncMock()
-        mock_llm.chat.return_value = MagicMock(content="User is interested in Python, AI, and distributed systems.")
+        mock_llm.chat.return_value = MagicMock(
+            content="User is interested in Python, AI, and distributed systems."
+        )
 
         with (
-            patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
-            patch("workers.tasks.generate_user_summary.render_prompt", return_value="Summarize this user."),
+            patch(
+                "workers.tasks.generate_user_summary.with_retry",
+                lambda **kw: lambda f: f,
+            ),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
+            patch(
+                "workers.tasks.generate_user_summary.render_prompt",
+                return_value="Summarize this user.",
+            ),
             patch("core.llm.resolve_backend", return_value=mock_llm),
             patch("core.org_config.get_org_config") as mock_cfg,
             patch("repositories.user_repository.UserRepository") as mock_repo_cls,
@@ -72,8 +88,15 @@ class TestGenerateUserSummary:
         mock_llm.chat.return_value = MagicMock(content="No significant history yet.")
 
         with (
-            patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
-            patch("workers.tasks.generate_user_summary.render_prompt", return_value="No history."),
+            patch(
+                "workers.tasks.generate_user_summary.with_retry",
+                lambda **kw: lambda f: f,
+            ),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
+            patch(
+                "workers.tasks.generate_user_summary.render_prompt",
+                return_value="No history.",
+            ),
             patch("core.llm.resolve_backend", return_value=mock_llm),
             patch("core.org_config.get_org_config"),
             patch("repositories.user_repository.UserRepository") as mock_repo_cls,
@@ -96,8 +119,15 @@ class TestGenerateUserSummary:
     async def test_llm_failure(self) -> None:
         """LLM failure → graceful degradation (exception propagates for retry)."""
         with (
-            patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
-            patch("workers.tasks.generate_user_summary.render_prompt", return_value="Prompt."),
+            patch(
+                "workers.tasks.generate_user_summary.with_retry",
+                lambda **kw: lambda f: f,
+            ),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
+            patch(
+                "workers.tasks.generate_user_summary.render_prompt",
+                return_value="Prompt.",
+            ),
             patch("core.llm.resolve_backend", side_effect=Exception("LLM timeout")),
             patch("core.org_config.get_org_config"),
         ):
@@ -115,8 +145,15 @@ class TestGenerateUserSummary:
     async def test_prompt_render_failure(self) -> None:
         """Prompt rendering failure propagates."""
         with (
-            patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
-            patch("workers.tasks.generate_user_summary.render_prompt", side_effect=Exception("Template error")),
+            patch(
+                "workers.tasks.generate_user_summary.with_retry",
+                lambda **kw: lambda f: f,
+            ),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
+            patch(
+                "workers.tasks.generate_user_summary.render_prompt",
+                side_effect=Exception("Template error"),
+            ),
         ):
             from workers.tasks.generate_user_summary import generate_user_summary
 
@@ -134,20 +171,29 @@ class TestGenerateUserSummary:
         mock_llm.chat.return_value = MagicMock(content="A summary.")
 
         with (
-            patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
-            patch("workers.tasks.generate_user_summary.render_prompt", return_value="Prompt."),
+            patch(
+                "workers.tasks.generate_user_summary.with_retry",
+                lambda **kw: lambda f: f,
+            ),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
+            patch(
+                "workers.tasks.generate_user_summary.render_prompt",
+                return_value="Prompt.",
+            ),
             patch("core.llm.resolve_backend", return_value=mock_llm),
             patch("core.org_config.get_org_config"),
             patch("repositories.user_repository.UserRepository") as mock_repo_cls,
         ):
             mock_repo = AsyncMock()
-            mock_repo.update_summary.side_effect = Exception("DB write failed")
+            # Prod logs and bare-``raise``s (generate_user_summary.py:228-235)
+            # — it does not wrap, so the injected type is the asserted type.
+            mock_repo.update_summary.side_effect = RuntimeError("DB write failed")
             mock_repo_cls.return_value = mock_repo
 
             db = self._make_db()
             from workers.tasks.generate_user_summary import generate_user_summary
 
-            with pytest.raises(Exception):
+            with pytest.raises(RuntimeError, match="DB write failed"):
                 await generate_user_summary(
                     ctx=self._ctx(db),
                     org_id=_ORG_ID,
@@ -161,10 +207,20 @@ class TestGenerateUserSummary:
         mock_llm.chat.return_value = MagicMock(content="Fallback summary.")
 
         with (
-            patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f),
-            patch("workers.tasks.generate_user_summary.render_prompt", return_value="Prompt."),
+            patch(
+                "workers.tasks.generate_user_summary.with_retry",
+                lambda **kw: lambda f: f,
+            ),
+            patch(_GRAPH_BACKEND_TARGET, return_value=_GRAPH_BACKEND),
+            patch(
+                "workers.tasks.generate_user_summary.render_prompt",
+                return_value="Prompt.",
+            ),
             patch("core.llm.resolve_backend", return_value=mock_llm),
-            patch("core.org_config.get_org_config", side_effect=Exception("Config fetch failed")),
+            patch(
+                "core.org_config.get_org_config",
+                side_effect=Exception("Config fetch failed"),
+            ),
             patch("repositories.user_repository.UserRepository") as mock_repo_cls,
         ):
             mock_repo = AsyncMock()
@@ -186,13 +242,18 @@ class TestGenerateUserSummary:
     @pytest.mark.asyncio
     async def test_db_error_propagates(self) -> None:
         """Database connection error propagates."""
-        with patch("workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f):
+        with patch(
+            "workers.tasks.generate_user_summary.with_retry", lambda **kw: lambda f: f
+        ):
             db = AsyncMock()
-            db.__aenter__.side_effect = Exception("Connection refused")
+            # ``session_factory()`` fails at __aenter__; the surrounding
+            # ``except GraphBackendUnavailableError`` does not catch it, so it
+            # propagates unwrapped (generate_user_summary.py:108-121).
+            db.__aenter__.side_effect = ConnectionError("Connection refused")
 
             from workers.tasks.generate_user_summary import generate_user_summary
 
-            with pytest.raises(Exception):
+            with pytest.raises(ConnectionError, match="Connection refused"):
                 await generate_user_summary(
                     ctx=self._ctx(db),
                     org_id=_ORG_ID,
