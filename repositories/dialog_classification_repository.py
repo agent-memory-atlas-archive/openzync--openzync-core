@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.sorting import SortSpec, resolve_order_by
 from models.dialog_classification import DialogClassification
 from models.episode import Episode
+from repositories.project_repository import archived_project_ids
 
 CLASSIFICATION_SORTABLE_COLUMNS = {
     "sequence_number": Episode.sequence_number,
@@ -83,7 +84,13 @@ class DialogClassificationRepository:
     async def count_for_session(
         self, org_id: UUID, session_id: UUID
     ) -> int:
-        """Count classifications for a session."""
+        """Count classifications for a session.
+
+        Archived projects are excluded: the dialog-classification worker
+        early-returns on them, so their rows are terminal, not a running
+        total. The sibling message/fact counts do not filter — they are
+        inventory.
+        """
         result = await self._db.execute(
             select(func.count())
             .select_from(DialogClassification)
@@ -92,6 +99,7 @@ class DialogClassificationRepository:
                 Episode.session_id == session_id,
                 DialogClassification.organization_id == org_id,
                 Episode.is_deleted == False,
+                DialogClassification.project_id.not_in(archived_project_ids()),
             )
         )
         return result.scalar_one()

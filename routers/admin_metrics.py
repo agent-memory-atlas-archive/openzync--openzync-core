@@ -30,8 +30,10 @@ from dependencies.db import get_db
 from dependencies.org_config import get_org_config
 from models.episode import Episode
 from models.fact import Fact
+from models.project import Project
 from models.user import User
 from packages.graph_backend.interface import GraphBackend
+from repositories.project_repository import archived_project_ids
 from schemas.admin_metrics import (
     EpisodeStats,
     GraphStats,
@@ -41,6 +43,7 @@ from schemas.organization_config import OrgConfigBase
 from schemas.sorting import MonitorTargetSortBy, SortDir
 from services.graph_stats_service import GraphStatsService
 from services.metrics_service import MetricsService
+from workers.tasks.base import ENRICHMENT_ALL
 
 logger = structlog.get_logger(__name__)
 
@@ -312,7 +315,10 @@ async def _entities_per_day(
     backend: GraphBackend | None = None,
 ) -> dict:
     stats = GraphStatsService(db, backend)
-    project_ids = await stats.resolve_project_ids(org_uuid, project_id)
+    # Inventory: archived projects keep their entities, so they stay in scope.
+    project_ids = await stats.resolve_project_ids(
+        org_uuid, project_id, include_archived=True
+    )
     cutoff = datetime.now(UTC) - timedelta(days=days)
     per_day = await stats.entity_counts_per_day(
         org_uuid, project_ids, cutoff, None
@@ -356,9 +362,12 @@ async def _facts_per_day(
 async def _enrichment_progress(
     db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
 ) -> dict:
+    # Progress metric — archived projects are excluded because the episode
+    # workers early-return on them, so those rows are terminal, not pending.
     conditions = [
         Episode.organization_id == org_uuid,
         Episode.is_deleted.is_(False),
+        Episode.project_id.not_in(archived_project_ids()),
     ]
     if project_id:
         conditions.append(Episode.project_id == project_id)
@@ -387,33 +396,45 @@ async def _enrichment_progress(
 
 
 async def _top_projects_by_episodes(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    days: int,
+    limit: int,
+    project_id: UUID | None,
+    include_archived: bool = False,
 ) -> dict:
+    # Volume metric — archiving preserves episodes, so archived projects are
+    # excluded by default (like every other ranking here) but each row still
+    # carries the flag, and ``include_archived`` lets the dashboard show them.
     conditions = [
         Episode.organization_id == org_uuid,
         Episode.is_deleted.is_(False),
     ]
     if project_id:
         conditions.append(Episode.project_id == project_id)
+    if not include_archived:
+        conditions.append(Project.is_archived.is_(False))
     stmt = (
         select(
             Episode.project_id,
             func.count(Episode.id).label("episode_count"),
+            Project.is_archived.label("is_archived"),
         )
         .select_from(Episode)
+        .join(Project, Project.id == Episode.project_id)
         .where(*conditions)
-        .group_by(Episode.project_id)
+        .group_by(Episode.project_id, Project.is_archived)
         .order_by(text("episode_count DESC"))
         .limit(limit)
     )
     result = await db.execute(stmt)
-    rows = [[str(r.project_id), r.episode_count] for r in result]
+    rows = [[str(r.project_id), r.episode_count, r.is_archived] for r in result]
     return _result(
         "top_projects_by_episodes",
         True,
-        ["project_id", "episode_count"],
+        ["project_id", "episode_count", "is_archived"],
         rows,
-        {"limit": limit},
+        {"limit": limit, "include_archived": include_archived},
     )
 
 
@@ -487,11 +508,15 @@ async def _latency_percentiles(
 async def _queue_depth_over_time(
     db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
 ) -> dict:
-    # Was Prometheus, now DB: pending enrichments (enrichment_status != 63) per day
+    # Was Prometheus, now DB: pending enrichments (enrichment_status != ALL) per day
+    # Progress metric — archived projects are excluded because the episode
+    # workers early-return on them, so including them would report a permanent
+    # non-draining phantom backlog that looks like a wedged queue.
     conditions = [
         Episode.organization_id == org_uuid,
         Episode.is_deleted.is_(False),
-        Episode.enrichment_status != 63,
+        Episode.enrichment_status != ENRICHMENT_ALL,
+        Episode.project_id.not_in(archived_project_ids()),
         Episode.created_at >= func.now() - text(f"interval '{days} days'"),
     ]
     if project_id:
@@ -545,7 +570,7 @@ AVAILABLE_QUERY_LIST: list[dict] = [
     {"name": "entities_per_day", "description": "Daily graph entity creation", "category": "graph", "org_scoped": True, "params": ["days"]},
     {"name": "facts_per_day", "description": "Daily fact extraction", "category": "graph", "org_scoped": True, "params": ["days"]},
     {"name": "enrichment_progress", "description": "Enrichment status breakdown", "category": "ingestion", "org_scoped": True, "params": []},
-    {"name": "top_projects_by_episodes", "description": "Projects ranked by episode count", "category": "projects", "org_scoped": True, "params": ["limit"]},
+    {"name": "top_projects_by_episodes", "description": "Projects ranked by episode count", "category": "projects", "org_scoped": True, "params": ["limit", "include_archived"]},
     {"name": "top_users_by_messages", "description": "Users ranked by message count", "category": "users", "org_scoped": True, "params": ["limit"]},
     {"name": "error_rate_by_day", "description": "Daily 5xx error counts", "category": "performance", "org_scoped": True, "params": ["days"]},
     {"name": "latency_percentiles", "description": "Current p50/p95/p99 latency", "category": "performance", "org_scoped": True, "params": []},
@@ -573,6 +598,13 @@ async def run_org_query(
     project_id: UUID | None = Query(
         default=None, description="Optional project UUID filter"
     ),
+    include_archived: bool = Query(
+        default=False,
+        description=(
+            "Include archived projects (top_projects_by_episodes only). "
+            "Archived is a soft delete, so volume metrics keep their data."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
     org_id: str = Depends(require_permission("members:read")),
     org_config: OrgConfigBase = Depends(get_org_config),
@@ -582,6 +614,9 @@ async def run_org_query(
 
     All queries are org-scoped (Prometheus handlers filter by org_id label;
     queue_depth_over_time is DB-backed pending enrichments per day).
+
+    ``include_archived`` applies to ``top_projects_by_episodes`` only; every
+    other handler accepts and ignores it.
 
     Raises:
         HTTPException: 422 if the query name is unknown.
@@ -600,6 +635,10 @@ async def run_org_query(
             request, db, org_config, UUID(org_id)
         )
         return await _entities_per_day(db, UUID(org_id), days, limit, project_id, backend)
+    if query == "top_projects_by_episodes":
+        return await handler(
+            db, UUID(org_id), days, limit, project_id, include_archived
+        )
     return await handler(db, UUID(org_id), days, limit, project_id)
 
 
@@ -690,11 +729,17 @@ async def _fetch_db_counts(
     Returns:
         Tuple of (EpisodeStats, GraphStats, user_count).
     """
-    # Define enrichment bitmask constants (mirrors services/worker/tasks/base.py)
-    ENRICHMENT_ENTITY_LINKS = 1 << 3
-    ENRICHMENT_NONE = 0
-
     # ── Episode counts ──────────────────────────────────────────────────
+    # Inventory below (total/24h) deliberately includes archived projects:
+    # archiving is a soft delete, so volume must not shrink.  The progress
+    # counts further down exclude them — the episode workers early-return on
+    # archived projects, so those rows are terminal, never "pending".
+    #
+    # Invariant: added_total == enrichable_total + archived_episodes. Both
+    # sides use the identical org + is_deleted filters and partition on the
+    # archived subquery, so this holds by construction — keep it that way if
+    # you add a third bucket.
+
     # Total episodes
     total_ep_result = await db.execute(
         select(func.count(Episode.id)).where(
@@ -714,12 +759,33 @@ async def _fetch_db_counts(
     )
     episodes_24h = ep_24h_result.scalar() or 0
 
+    # Episodes in archived projects — excluded from every progress count below
+    archived_ep_result = await db.execute(
+        select(func.count(Episode.id)).where(
+            Episode.organization_id == org_id,
+            Episode.is_deleted.is_(False),
+            Episode.project_id.in_(archived_project_ids()),
+        )
+    )
+    episodes_archived = archived_ep_result.scalar() or 0
+
+    # Episodes eligible for enrichment — the progress denominator
+    enrichable_ep_result = await db.execute(
+        select(func.count(Episode.id)).where(
+            Episode.organization_id == org_id,
+            Episode.is_deleted.is_(False),
+            Episode.project_id.not_in(archived_project_ids()),
+        )
+    )
+    episodes_enrichable = enrichable_ep_result.scalar() or 0
+
     # Episodes with incomplete enrichment (some bits still 0)
     in_prog_result = await db.execute(
         select(func.count(Episode.id)).where(
             Episode.organization_id == org_id,
             Episode.is_deleted.is_(False),
-            Episode.enrichment_status != 63,  # not all bits set
+            Episode.enrichment_status != ENRICHMENT_ALL,
+            Episode.project_id.not_in(archived_project_ids()),
         )
     )
     episodes_in_progress = in_prog_result.scalar() or 0
@@ -729,27 +795,32 @@ async def _fetch_db_counts(
         select(func.count(Episode.id)).where(
             Episode.organization_id == org_id,
             Episode.is_deleted.is_(False),
-            Episode.enrichment_status == ENRICHMENT_NONE,
+            Episode.enrichment_status == 0,
+            Episode.project_id.not_in(archived_project_ids()),
         )
     )
     episodes_pending = pending_result.scalar() or 0
 
-    # Fully enriched episodes (all 6 bits = status 63)
+    # Fully enriched episodes (all active bits set)
     fully_enriched_result = await db.execute(
         select(func.count(Episode.id)).where(
             Episode.organization_id == org_id,
             Episode.is_deleted.is_(False),
-            Episode.enrichment_status == 63,
+            Episode.enrichment_status == ENRICHMENT_ALL,
+            Episode.project_id.not_in(archived_project_ids()),
         )
     )
     episodes_fully_enriched = fully_enriched_result.scalar() or 0
 
-    # Episodes with embedding populated
+    # Episodes with embedding populated.  embed_episode also early-returns on
+    # archived projects, so this must be filtered too — otherwise the
+    # "Embedded" tile would exceed the "Enriched" tile, which reads as a bug.
     with_embeddings_result = await db.execute(
         select(func.count(Episode.id)).where(
             Episode.organization_id == org_id,
             Episode.is_deleted.is_(False),
             Episode.embedding.isnot(None),
+            Episode.project_id.not_in(archived_project_ids()),
         )
     )
     episodes_with_embeddings = with_embeddings_result.scalar() or 0
@@ -761,16 +832,20 @@ async def _fetch_db_counts(
         enrichment_pending=episodes_pending,
         fully_enriched=episodes_fully_enriched,
         with_embeddings=episodes_with_embeddings,
+        archived_episodes=episodes_archived,
+        enrichable_total=episodes_enrichable,
         fully_enriched_pct=round(
-            episodes_fully_enriched / episodes_total * 100, 1
-        ) if episodes_total > 0 else 0.0,
+            episodes_fully_enriched / episodes_enrichable * 100, 1
+        ) if episodes_enrichable > 0 else 0.0,
     )
 
     # ── Graph counts (backend-backed, org-wide fan-out) ─────────────
     # The PG graph_entities stub is never written by the FalkorDB/SurrealDB
     # paths — counts come from the backend's get_all_entities + len().
+    # entities_total is inventory, so archived projects are included here;
+    # org-wide fan-out already included them via OrgStatsResponse.
     stats = GraphStatsService(db, backend)
-    project_ids = await stats.resolve_project_ids(org_id, None)
+    project_ids = await stats.resolve_project_ids(org_id, None, include_archived=True)
     entities_total, entities_24h = await stats.entity_totals(org_id, project_ids)
 
     graph_stats = GraphStats(

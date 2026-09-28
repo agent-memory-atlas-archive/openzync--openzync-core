@@ -65,6 +65,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import get_settings
 from repositories.episode_repository import EpisodeRepository
+from workers.tasks.base import (  # noqa: F401  — re-export
+    ENRICHMENT_ALL,
+    ENRICHMENT_EMBEDDING,
+    ENRICHMENT_ENTITIES,
+    ENRICHMENT_ENTITY_LINKS,
+    ENRICHMENT_FACTS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -161,18 +168,11 @@ end
 # These constants represent each enrichment task's bit position in the
 # ``episodes.enrichment_status`` integer column.  Combine with bitwise OR (``|``)
 # to mark multiple tasks as completed.
-
-ENRICHMENT_ENTITIES: int = 1 << 0      # bit 0: entity extraction
-ENRICHMENT_EMBEDDING: int = 1 << 1     # bit 1: episode embedding
-ENRICHMENT_FACTS: int = 1 << 2         # bit 2: fact extraction
-ENRICHMENT_ENTITY_LINKS: int = 1 << 3    # bit 3: entity-episode linking
-ENRICHMENT_ALL: int = (
-    ENRICHMENT_ENTITIES
-    | ENRICHMENT_EMBEDDING
-    | ENRICHMENT_FACTS
-    | ENRICHMENT_ENTITY_LINKS
-)
-"""Bitmask with all bits set — used to check if an episode is fully enriched."""
+#
+# Re-exported from workers.tasks.base (imported above) — the single source of
+# truth.  This module previously redefined the bitmask and got it WRONG: it
+# OR'd only bits 0-3, yielding ENRICHMENT_ALL = 15 instead of 63, so any caller
+# that treated it as "fully enriched" would have accepted a half-done episode.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

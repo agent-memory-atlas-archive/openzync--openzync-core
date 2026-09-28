@@ -61,10 +61,26 @@ class EpisodeStats(BaseModel):
     added_total: int = Field(0, description="Total episodes ever created")
     added_24h: int = Field(0, description="Episodes created in last 24 hours")
     in_progress: int = Field(0, description="Episodes with incomplete enrichment")
-    enrichment_pending: int = Field(0, description="Episodes with no enrichment started")
-    fully_enriched: int = Field(0, description="Episodes with all enrichment bits set (status=63)")
-    with_embeddings: int = Field(0, description="Episodes with embedding vector populated")
-    fully_enriched_pct: float = Field(0.0, description="Percentage of episodes fully enriched")
+    enrichment_pending: int = Field(
+        0, description="Episodes with no enrichment started"
+    )
+    fully_enriched: int = Field(
+        0, description="Episodes with all enrichment bits set (status=ENRICHMENT_ALL)"
+    )
+    with_embeddings: int = Field(
+        0, description="Episodes with embedding vector populated"
+    )
+    archived_episodes: int = Field(
+        0,
+        description="Episodes in archived projects (excluded from enrichment progress)",
+    )
+    enrichable_total: int = Field(
+        0,
+        description="Episodes in non-archived projects — the enrichment progress denominator",
+    )
+    fully_enriched_pct: float = Field(
+        0.0, description="Percentage of enrichable episodes fully enriched"
+    )
 
 
 class GraphStats(BaseModel):
