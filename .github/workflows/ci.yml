@@ -2,7 +2,8 @@
 # OpenZync — GitHub Actions CI pipeline (PR-only)
 # ──────────────────────────────────────────────────────────────────────────────
 # Stages:
-#   lint            → ruff, mypy (diff-scoped on changed .py files)
+#   lint            → ruff check + ruff format (file-scoped on changed .py files)
+#   mypy            → advisory type check, non-blocking
 #   test-unit       → pytest with coverage
 #   test-integration → combined unit + integration coverage (Postgres + Redis + FalkorDB)
 # Tag builds/deploys live in cd.yml.
@@ -92,6 +93,38 @@ jobs:
           else
             ruff format --check "${existing[@]}"
           fi
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # MYPY — advisory
+  # ═════════════════════════════════════════════════════════════════════════════
+  # Non-blocking, mirroring .gitlab-ci.yml's `mypy:` job (allow_failure: true).
+  #
+  # Kept out of the `lint` job deliberately. mypy used to be the last step of
+  # `lint`, so any ruff failure meant it never executed at all — the type check
+  # reported nothing for this pipeline's entire life, and its 599 pre-existing
+  # errors (537 of them in files no given PR touches) went unseen. Splitting it
+  # out means it always runs and reports, without a ruff regression hiding it or
+  # a type regression hiding ruff.
+  mypy:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          base: origin/master
+          list-files: shell
+          filters: |
+            py_changed:
+              - '**/*.py'
+      - run: pip install -r requirements.txt
       - if: steps.filter.outputs.py_changed == 'true'
         run: mypy core/ middleware/ dependencies/ routers/ models/ schemas/ services/
 

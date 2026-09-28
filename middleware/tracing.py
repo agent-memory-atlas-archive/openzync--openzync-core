@@ -128,9 +128,11 @@ def _init_tracer() -> Any | None:
 
         logger.info(
             "OpenTelemetry initialised",
-            endpoint=otlp_endpoint,
-            sample_rate=sample_rate,
-            service_name=service_name,
+            extra={
+                "endpoint": otlp_endpoint,
+                "sample_rate": sample_rate,
+                "service_name": service_name,
+            },
         )
     except ImportError:
         logger.warning(

@@ -257,7 +257,9 @@ async def _lookup_key_in_redis(
             # because we wrote it ourselves.
             return cast("dict[str, Any]", orjson.loads(cached.encode()))
         except (orjson.JSONDecodeError, TypeError):
-            logger.warning("Corrupted auth cache entry, ignoring", key=cache_key)
+            logger.warning(
+                "Corrupted auth cache entry, ignoring", extra={"key": cache_key}
+            )
             await redis.delete(cache_key)
     return None
 
