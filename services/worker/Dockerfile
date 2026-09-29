@@ -26,16 +26,25 @@
 FROM python:3.12-slim AS builder
 WORKDIR /app
 
+# APP_VERSION carries the release version into builds without git history
+# (build context excludes .git, so hatch-vcs would otherwise fall back).
+ARG APP_VERSION=""
+
 # Install build dependencies and the package itself.
 # NOTE: README.md must be copied too — hatchling validates it exists at build time.
 COPY pyproject.toml README.md .
-RUN pip install --no-cache-dir --user -e ".[llm]" \
+RUN if [ -n "$APP_VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$APP_VERSION"; fi \
+    && pip install --no-cache-dir --user -e ".[llm]" \
     && pip install --no-cache-dir --user https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
 # ──────────────────────────────────────────────────────────────────────────────
 
 FROM python:3.12-slim AS runtime
 WORKDIR /app
+
+# Propagate the build-time version to runtime so core/_version.py prefers it.
+ARG APP_VERSION=""
+ENV OPENZYNC_VERSION=$APP_VERSION
 
 # Copy installed packages from builder.
 COPY --from=builder /root/.local /root/.local
