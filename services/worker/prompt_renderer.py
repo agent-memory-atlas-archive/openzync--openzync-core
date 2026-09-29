@@ -836,6 +836,11 @@ async def _fetch_user_classifications(
 ) -> dict[str, Any]:
     """Fetch aggregate classification labels for a user.
 
+    Archived projects are excluded: their episodes stopped being classified
+    (the workers early-return on archived), so including them would let stale
+    conversations dominate the generated summary.  Neither intent nor emotion
+    is a displayed number or model-neutral input — the bias would be silent.
+
     Returns ``{"classifications": {"top_intents": [...], "top_emotions": [...]}}``
     or empty dict if no user_id.
     """
@@ -850,7 +855,9 @@ async def _fetch_user_classifications(
             FROM dialog_classifications dc
             JOIN episodes e ON dc.episode_id = e.id
             JOIN sessions s ON e.session_id = s.id
+            JOIN projects p ON s.project_id = p.id
             WHERE s.user_id = :user_id AND s.organization_id = :org_id
+              AND p.is_archived = false
             GROUP BY intent, emotion
             ORDER BY cnt DESC
             LIMIT 5

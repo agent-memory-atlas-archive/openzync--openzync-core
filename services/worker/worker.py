@@ -588,7 +588,7 @@ async def main() -> NoReturn:
 
     # ── Enrichment reconciliation (every 5 min) ────────────────────
     # Safety net for worker crashes: re-enqueues enrichment tasks for
-    # episodes that have been stale for >10 minutes.
+    # episodes that have been stale for >30 minutes.
     cron_jobs: list[CronJob] = [
         cron(
             reconcile_enrichment,

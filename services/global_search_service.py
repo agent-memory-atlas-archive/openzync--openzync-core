@@ -150,6 +150,7 @@ class GlobalSearchService:
             WHERE p.organization_id = :org_id
               AND pm.user_id = :user_id
               AND s.is_deleted = false
+              AND p.is_archived = false
               AND s.external_id ILIKE :pattern
             LIMIT :limit
         """)

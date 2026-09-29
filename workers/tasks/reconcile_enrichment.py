@@ -1,10 +1,10 @@
 """Enrichment reconciliation — detects stale episodes and re-enqueues missing tasks.
 
 Runs as a periodic ARQ job every 5 minutes.  Queries episodes where
-``enrichment_status != ENRICHMENT_ALL`` and that were created or last updated
-more than 10 minutes ago (skipping episodes still in-flight).  For each stale
-episode, checks which enrichment bits are missing and re-enqueues only the
-missing tasks on the high-priority queue.
+the LLM enrichment bits are not all set and that were created or last
+updated more than 30 minutes ago (skipping episodes still in-flight).
+For each stale episode, checks which enrichment bits are missing and
+re-enqueues only the missing tasks on the high-priority queue.
 
 Also runs a separate fact-embedding repair pass: facts with no embedding and
 no ``embedded_at`` timestamp (never attempted, not retracted) are re-enqueued
@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from workers.tasks.base import (
-    ENRICHMENT_ALL,
     ENRICHMENT_CLASSIFICATION,
     ENRICHMENT_EMBEDDING,
     ENRICHMENT_ENTITIES,
@@ -264,10 +263,11 @@ async def _repair_missing_fact_embeddings(
 async def reconcile_enrichment(ctx: dict[str, Any]) -> str:
     """Detect stale episodes and re-enqueue missing enrichment tasks.
 
-    Queries episodes where ``enrichment_status != ENRICHMENT_ALL`` and
-    ``updated_at < NOW() - INTERVAL '{STALE_AFTER_MINUTES} minutes'``.
-    For each, checks the current bitmask, computes missing bits, and enqueues
-    the corresponding ARQ tasks on the high-priority queue.
+    Queries episodes where ``(enrichment_status & LLM_ENRICHMENT_BITS)
+    != LLM_ENRICHMENT_BITS`` and ``updated_at`` is older than
+    ``STALE_AFTER_MINUTES``.  For each, checks the current bitmask,
+    computes missing bits, and enqueues the corresponding ARQ tasks on
+    the high-priority queue.
 
     Runs every 5 minutes as an ARQ cron job.  Self-limiting to
     ``RECONCILE_BATCH_SIZE`` (100) episodes per tick to avoid enqueue bursts.
@@ -353,7 +353,9 @@ async def reconcile_enrichment(ctx: dict[str, Any]) -> str:
                 Episode.metadata_,
                 Episode.enrichment_status,
             ).where(
-                Episode.enrichment_status != ENRICHMENT_ALL,
+                (Episode.enrichment_status.op("&")(LLM_ENRICHMENT_BITS))
+                != LLM_ENRICHMENT_BITS,
+                Episode.is_deleted.is_(False),
                 Episode.updated_at < cutoff,
                 Episode.project_id.not_in(
                     select(Project.id).where(Project.is_archived.is_(True))

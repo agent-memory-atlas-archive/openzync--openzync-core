@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.sorting import SortSpec, resolve_order_by
 from models.episode import Episode
 from models.structured_extraction import StructuredExtraction
+from repositories.project_repository import archived_project_ids
 
 EXTRACTION_SORTABLE_COLUMNS = {
     "sequence_number": Episode.sequence_number,
@@ -86,7 +87,13 @@ class StructuredExtractionRepository:
     async def count_for_session(
         self, org_id: UUID, session_id: UUID
     ) -> int:
-        """Count extractions for a session."""
+        """Count extractions for a session.
+
+        Archived projects are excluded: the ``extract_structured`` worker
+        early-returns on them, so their rows are terminal, not a running
+        total. The sibling message/fact counts do not filter — they are
+        inventory.
+        """
         result = await self._db.execute(
             select(func.count())
             .select_from(StructuredExtraction)
@@ -95,6 +102,7 @@ class StructuredExtractionRepository:
                 Episode.session_id == session_id,
                 Episode.organization_id == org_id,
                 Episode.is_deleted == False,
+                StructuredExtraction.project_id.not_in(archived_project_ids()),
             )
         )
         return result.scalar_one()

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import contains_eager
 
@@ -31,6 +31,30 @@ PROJECT_MEMBER_SORTABLE_COLUMNS = {
     "email": User.email,
 }
 """Sortable columns for project members (default created_at/asc)."""
+
+
+def archived_project_ids() -> Select[tuple[UUID]]:
+    """Return a subquery of archived project IDs.
+
+    The single place the archived-project predicate is expressed. Combine it
+    with a project's foreign key column::
+
+        Episode.project_id.not_in(archived_project_ids())
+
+    Every table carrying enrichment state (``episodes``, ``facts``,
+    ``dialog_classifications``, ``structured_extractions``, ``sessions``,
+    ``graph_observations``) has a ``NOT NULL``, indexed ``project_id``, so no
+    join is required.
+
+    Only use this on **progress** aggregates — work done or work left. Archived
+    is a terminal state, so counting archived rows as "still pending" is what
+    makes a metric permanently unreachable. **Inventory/volume** aggregates
+    must include archived rows, because archiving is a soft delete that
+    preserves data.
+
+    Backed by the ``ix_projects_not_archived`` partial index (migration 0057).
+    """
+    return select(Project.id).where(Project.is_archived.is_(True))
 
 
 class ProjectRepository:

@@ -58,13 +58,31 @@ class GraphStatsService:
         self._backend = backend
 
     async def resolve_project_ids(
-        self, org_id: UUID, project_id: UUID | None
+        self,
+        org_id: UUID,
+        project_id: UUID | None,
+        *,
+        include_archived: bool = False,
     ) -> list[UUID]:
         """Resolve the project scope for an org-wide or project-scoped query.
 
-        A concrete ``project_id`` passes through; ``None`` fans out to all
-        non-archived projects in the org (paginated — orgs may exceed one
-        page).
+        A concrete ``project_id`` passes through; ``None`` fans out to the
+        org's projects (paginated — orgs may exceed one page).
+
+        ``include_archived=False`` (the default) skips archived projects. Pass
+        ``True`` for **inventory** aggregates only: archiving is a soft delete
+        that preserves data, so counting entities must not shrink when a
+        project is archived. Progress aggregates should keep the default.
+
+        Args:
+            org_id: Tenant scope.
+            project_id: Explicit project scope, or ``None`` for org-wide.
+            include_archived: If ``True``, fan out to archived projects too.
+                Has no effect when ``project_id`` is given — an explicit scope
+                is honoured verbatim.
+
+        Returns:
+            The list of project UUIDs in scope.
         """
         if project_id is not None:
             return [project_id]
@@ -77,6 +95,7 @@ class GraphStatsService:
                 user_id=None,
                 limit=_PROJECT_PAGE_SIZE,
                 offset=offset,
+                include_archived=include_archived,
             )
             if not page:
                 break

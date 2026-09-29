@@ -403,7 +403,9 @@ async def get_usage_stats(
     # per day in Python.  Response keys are unchanged.
     backend = await _resolve_graph_backend(request, db, org_config, org_uuid)
     stats = GraphStatsService(db, backend)
-    node_project_ids = await stats.resolve_project_ids(org_uuid, project_id)
+    node_project_ids = await stats.resolve_project_ids(
+        org_uuid, project_id, include_archived=True
+    )
     node_per_day = await stats.entity_counts_per_day(
         org_uuid, node_project_ids, start, end_exclusive
     )

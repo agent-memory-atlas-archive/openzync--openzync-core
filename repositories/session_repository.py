@@ -27,6 +27,8 @@ from models.fact import Fact
 from models.graph_observation import GraphObservation
 from models.project import Project
 from models.session import Session
+from repositories.project_repository import archived_project_ids
+from workers.tasks.base import ENRICHMENT_ALL
 
 SESSION_SORTABLE_COLUMNS = {
     "external_id": Session.external_id,
@@ -583,12 +585,19 @@ class SessionRepository:
             .scalar_subquery()
             .label("last_message_at")
         )
+        # Progress count — archived projects are excluded because the episode
+        # workers early-return on them, so those rows never reach
+        # ENRICHMENT_ALL and would count as permanently pending.  The
+        # sibling msg/fact/last_msg counts stay unfiltered: they are
+        # inventory, and an archived project's detail view still shows them.
         pending_enrich_subq = (
             select(func.count(Episode.id))
             .where(
                 Episode.session_id == Session.id,
                 Episode.is_deleted.is_(False),
-                Episode.enrichment_status != 63,  # ENRICHMENT_ALL = bits 0-5
+                (Episode.enrichment_status.op("&")(ENRICHMENT_ALL))
+                != ENRICHMENT_ALL,
+                Episode.project_id.not_in(archived_project_ids()),
             )
             .correlate(Session)
             .scalar_subquery()
