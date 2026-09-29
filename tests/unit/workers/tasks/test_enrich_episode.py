@@ -906,7 +906,7 @@ class TestEnrichEpisodeOrgConfig:
 
             assert result is None
             # LLM was still called (resolve_backend called with None config)
-            mock_resolve_backend.assert_called_once_with(org_config=None)
+            mock_resolve_backend.assert_called_once_with(org_config=None, sink=ANY)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

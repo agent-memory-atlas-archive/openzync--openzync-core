@@ -103,6 +103,7 @@ def stub_llm(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
         provider: str | None = None,
         org_config: dict | None = None,
         mode: str | None = None,
+        sink: Any = None,
     ) -> _FakeChatBackend:
         return _FakeChatBackend(state["content"])
 

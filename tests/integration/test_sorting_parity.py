@@ -787,11 +787,16 @@ def _fake_embedding_backend(monkeypatch: Any) -> None:
         embeddings: list[list[float]] | None = None
 
     class _Backend:
-        async def embed(self, texts: Any, model: Any = None) -> _Resp:
+        async def embed(
+            self, texts: Any, model: Any = None, metered: bool = True
+        ) -> _Resp:
             return _Resp(embeddings=[[0.0] * 768 for _ in texts])
 
     async def _resolve(
-        provider: Any = None, org_config: Any = None, mode: Any = None
+        provider: Any = None,
+        org_config: Any = None,
+        mode: Any = None,
+        sink: Any = None,
     ) -> _Backend:
         return _Backend()
 

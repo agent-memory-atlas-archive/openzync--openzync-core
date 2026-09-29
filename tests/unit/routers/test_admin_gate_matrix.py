@@ -221,6 +221,10 @@ def _make_app(
     register_exception_handlers(app)
     app.state.redis = AsyncMock()
     app.state.openbao_client = AsyncMock()  # org-config service dep
+    # Preview router reads request.app.state.db_session_factory; None means
+    # unmetered preview in the service layer — set here so the harness,
+    # not the gate, is what the 403/401 matrix exercises.
+    app.state.db_session_factory = None
     app.dependency_overrides[get_db] = lambda: AsyncMock()
     # get_user_summary_service is declared BEFORE the gate in the summary
     # handlers' signatures and calls core.arq.get_arq() (RuntimeError when
