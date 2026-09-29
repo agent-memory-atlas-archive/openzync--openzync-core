@@ -22,7 +22,6 @@ from core.exceptions import (
     EpisodeNotFoundError,
     ExternalServiceError,
     GraphTimeoutError,
-    InsufficientCreditsError,
     NotFoundError,
     PayloadTooLargeError,
     RateLimitError,
@@ -43,7 +42,6 @@ class TestExceptionHierarchy:
             (AuthorizationError, 403, "authorization_error"),
             (ConflictError, 409, "conflict"),
             (RateLimitError, 429, "rate_limit_exceeded"),
-            (InsufficientCreditsError, 402, "insufficient_credits"),
             (ExternalServiceError, 502, "external_service_error"),
             (PayloadTooLargeError, 413, "payload_too_large"),
             (EntityNotFoundError, 404, "entity_not_found"),
@@ -76,7 +74,6 @@ class TestExceptionHierarchy:
             EpisodeNotFoundError,
             GraphTimeoutError,
             RateLimitError,
-            InsufficientCreditsError,
             ExternalServiceError,
             PayloadTooLargeError,
         ]

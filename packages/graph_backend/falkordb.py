@@ -103,6 +103,30 @@ _SAFE_EDGE_TYPE_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 MAX_TRAVERSAL_DEPTH: int = 5
 """Hard cap on BFS depth to prevent unbounded traversals."""
 
+_REDISEARCH_ESCAPE_CHARS = frozenset("\\!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~")
+"""Chars RediSearch parses as query operators — escape with a backslash."""
+
+
+def _escape_redisearch_query(text: str) -> str:
+    r"""Escape RediSearch operators in free text for ``queryNodes`` queries.
+
+    RediSearch parses punctuation as query syntax (``%`` fuzzy, ``|`` OR,
+    ``*`` wildcard, ``-`` negation), so raw LLM/user input like ``94%``
+    raises ``ResponseError: Syntax error``. Single-pass escape keeps spaces
+    as BM25 term separators; added backslashes are never re-processed, so a
+    literal backslash safely becomes ``\\``.
+
+    Args:
+        text: Raw user/LLM-derived search string.
+
+    Returns:
+        The string with every RediSearch special char backslash-escaped.
+    """
+    return "".join(
+        f"\\{char}" if char in _REDISEARCH_ESCAPE_CHARS else char for char in text
+    )
+
+
 # ── Schema bootstrap queries ───────────────────────────────────────────────
 
 _SCHEMA_VERSION: int = 2
@@ -1546,7 +1570,7 @@ class FalkorGraphBackend(GraphBackend):
                 ORDER BY score DESC
                 """,
                 {
-                    "query": query,
+                    "query": _escape_redisearch_query(query),
                     "entity_types": types if types is not None else [],
                     "entity_types_null": types is None,
                 },
@@ -2419,7 +2443,7 @@ class FalkorGraphBackend(GraphBackend):
                 LIMIT $limit
                 """,
                 {
-                    "query": query,
+                    "query": _escape_redisearch_query(query),
                     "threshold": fuzzy_threshold,
                     "org_id": str(org_id),
                     "project_id": str(project_id),
