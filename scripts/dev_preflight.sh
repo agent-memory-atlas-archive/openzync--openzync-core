@@ -380,7 +380,7 @@ up() {
     # Unconditional every run: secret_ids rotate on each bootstrap, so .env must re-sync.
     bootstrap
     sync_env
-    log "Done. Dev deps up. API: uvicorn services.api.asgi:app --reload"
+    log "Done. Dev deps up. API: uvicorn services.api.asgi:app --reload --host 0.0.0.0"
 }
 
 down() {

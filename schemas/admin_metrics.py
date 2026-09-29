@@ -119,19 +119,19 @@ class MetricsSummaryResponse(BaseModel):
     # ── Time-series (from Prometheus range queries) ─────────────────────────
     retrieval_timeseries: RetrievalTimeseries = Field(
         default_factory=RetrievalTimeseries,
-        description="Retrieval rate over the last 24h",
+        description="Retrieval rate over the requested window (default last 24h)",
     )
     error_timeseries: list[ErrorTimeseriesPoint] = Field(
         default_factory=list,
-        description="Hourly 4xx/5xx error counts over the last 24h",
+        description="4xx/5xx error counts over the requested window (default last 24h)",
     )
     context_latency_timeseries: list[LatencyTimeseriesPoint] = Field(
         default_factory=list,
-        description="Context latency percentiles over the last 24h",
+        description="Context latency over the requested window (default last 24h)",
     )
     graph_latency_timeseries: list[LatencyTimeseriesPoint] = Field(
         default_factory=list,
-        description="Graph search latency percentiles over the last 24h",
+        description="Graph search latency over the requested window (default last 24h)",
     )
 
     # ── Health ─────────────────────────────────────────────────────────────
