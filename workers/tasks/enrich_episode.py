@@ -13,7 +13,6 @@ Bitmask:
 
 from __future__ import annotations
 
-import time
 import uuid
 from typing import TYPE_CHECKING, cast
 
@@ -167,7 +166,7 @@ async def enrich_episode(
         EntityExtractionOutput,
         FactExtractionOutput,
     )
-    from services.usage_service import record_llm_usage
+    from services.usage_service import make_sink
     from workers.backend import resolve_graph_backend
     from workers.tasks.classify_dialog import process_classification_output
     from workers.tasks.extract_entities import process_entities_output
@@ -355,8 +354,15 @@ async def enrich_episode(
             # ── 5. Single LLM call ──────────────────────────────────────
             log.info("enrich_episode.llm_call_start")
             try:
-                llm = await resolve_backend(org_config=llm_config_dict)
-                start = time.monotonic()
+                sink = make_sink(
+                    session_factory,
+                    org_id=uuid.UUID(org_id),
+                    worker="enrich_episode",
+                    project_id=uuid.UUID(project_id),
+                    episode_id=uuid.UUID(episode_id),
+                    session_id=uuid.UUID(session_id) if session_id else None,
+                )
+                llm = await resolve_backend(org_config=llm_config_dict, sink=sink)
                 response = await llm.chat(
                     [
                         {
@@ -369,21 +375,11 @@ async def enrich_episode(
                     temperature=0.0,
                     max_tokens=8192,
                     cache_config=build_cache_config(org_config=llm_config_dict),
+                    metered=True,
                 )
             except Exception:
                 log.exception("enrich_episode.llm_call_failed")
                 raise
-
-            # Record usage in the same transaction as the enrichment work —
-            # commits atomically with the savepoints below.
-            await record_llm_usage(
-                session=db,
-                organization_id=uuid.UUID(org_id),
-                model=response.model,
-                task_type="enrich_episode",
-                usage=response.usage,
-                duration_ms=round((time.monotonic() - start) * 1000),
-            )
 
             # chat() was called with response_model=CombinedLLMOutput, so a
             # successful call guarantees validated_data is a CombinedLLMOutput.

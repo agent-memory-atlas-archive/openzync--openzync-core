@@ -34,6 +34,42 @@ from core.llm import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_openai_usage(usage_data: Any) -> TokenUsage:
+    """Build a TokenUsage from an OpenAI-style usage object, best-effort.
+
+    Reasoning tokens come from ``completion_tokens_details.reasoning_tokens``
+    (folded into ``completion_tokens`` by providers, so ``total_tokens``
+    stays prompt + completion). Missing attributes read as zero.
+    """
+    if usage_data is None:
+        return TokenUsage()
+    prompt_details = getattr(usage_data, "prompt_tokens_details", None)
+    completion_details = getattr(usage_data, "completion_tokens_details", None)
+    return TokenUsage(
+        prompt_tokens=getattr(usage_data, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(usage_data, "completion_tokens", 0) or 0,
+        reasoning_tokens=(
+            getattr(completion_details, "reasoning_tokens", 0) or 0
+            if completion_details
+            else 0
+        ),
+        cache_read_input_tokens=(
+            getattr(prompt_details, "cached_tokens", 0) or 0 if prompt_details else 0
+        ),
+        cache_creation_input_tokens=(
+            getattr(prompt_details, "cache_write_tokens", 0) or 0
+            if prompt_details
+            else 0
+        ),
+    )
+
+
+def _parse_embed_usage(response: Any) -> TokenUsage:
+    """Read embedding prompt tokens from a provider response, best-effort."""
+    usage = getattr(response, "usage", None)
+    return TokenUsage(prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Ollama
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -74,6 +110,11 @@ class OllamaBackend(LLMBackend):
     @property
     def model_name(self) -> str:
         return self._chat_model
+
+    @property
+    def provider_name(self) -> str:
+        """Return the registry key for this backend."""
+        return "ollama"
 
     @property
     def embedding_dim(self) -> int:
@@ -157,6 +198,8 @@ class OllamaBackend(LLMBackend):
         content: str = data.get("message", {}).get("content", "")
 
         usage_data = data.get("metrics", {})
+        if not usage_data:
+            logger.debug("ollama.chat_metrics_missing", extra={"model": model})
         usage = TokenUsage(
             prompt_tokens=usage_data.get("prompt_eval_count", 0),
             completion_tokens=usage_data.get("eval_count", 0),
@@ -177,7 +220,7 @@ class OllamaBackend(LLMBackend):
             content=content, model=data.get("model", model), usage=usage
         )
 
-    async def embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
+    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
         """Generate embeddings via Ollama's ``/api/embeddings`` endpoint.
 
         Supported kwargs:
@@ -236,8 +279,13 @@ class OllamaBackend(LLMBackend):
             },
         )
 
+        logger.debug("ollama.embed_metrics_missing", extra={"model": model})
+
         return EmbeddingResponse(
-            embeddings=embeddings, model=data.get("model", model), dim=dim
+            embeddings=embeddings,
+            model=data.get("model", model),
+            dim=dim,
+            usage=TokenUsage(),
         )
 
 
@@ -275,6 +323,11 @@ class OpenAIBackend(LLMBackend):
     @property
     def model_name(self) -> str:
         return self._chat_model
+
+    @property
+    def provider_name(self) -> str:
+        """Return the registry key for this backend."""
+        return "openai"
 
     @property
     def embedding_dim(self) -> int:
@@ -339,30 +392,7 @@ class OpenAIBackend(LLMBackend):
                             "OpenAI response content is None and no tool calls present"
                         )
                 usage_data = response.usage
-                cached_tokens = 0
-                cache_write_tokens = 0
-                if (
-                    usage_data
-                    and hasattr(usage_data, "prompt_tokens_details")
-                    and usage_data.prompt_tokens_details
-                ):
-                    cached_tokens = (
-                        getattr(usage_data.prompt_tokens_details, "cached_tokens", 0)
-                        or 0
-                    )
-                    cache_write_tokens = (
-                        getattr(
-                            usage_data.prompt_tokens_details, "cache_write_tokens", 0
-                        )
-                        or 0
-                    )
-
-                usage = TokenUsage(
-                    prompt_tokens=usage_data.prompt_tokens if usage_data else 0,
-                    completion_tokens=usage_data.completion_tokens if usage_data else 0,
-                    cache_read_input_tokens=cached_tokens,
-                    cache_creation_input_tokens=cache_write_tokens,
-                )
+                usage = _parse_openai_usage(usage_data)
 
                 logger.info(
                     "llm.chat_completed",
@@ -372,8 +402,9 @@ class OpenAIBackend(LLMBackend):
                         "duration_ms": round(elapsed * 1000),
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
-                        "cached_tokens": cached_tokens,
-                        "cache_write_tokens": cache_write_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
+                        "cached_tokens": usage.cache_read_input_tokens,
+                        "cache_write_tokens": usage.cache_creation_input_tokens,
                     },
                 )
 
@@ -419,7 +450,7 @@ class OpenAIBackend(LLMBackend):
             f"OpenAI chat failed after {self.MAX_RETRIES} retries: {last_exception}"
         ) from last_exception
 
-    async def embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
+    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
         """Generate embeddings via OpenAI's embeddings API.
 
         Supported kwargs:
@@ -459,6 +490,7 @@ class OpenAIBackend(LLMBackend):
             embeddings=embeddings,
             model=model,
             dim=dim,
+            usage=_parse_embed_usage(response),
         )
 
 
@@ -505,6 +537,11 @@ class AzureBackend(LLMBackend):
     @property
     def model_name(self) -> str:
         return self._chat_model
+
+    @property
+    def provider_name(self) -> str:
+        """Return the registry key for this backend."""
+        return "azure"
 
     @property
     def embedding_dim(self) -> int:
@@ -572,30 +609,7 @@ class AzureBackend(LLMBackend):
                             "Azure OpenAI response content is None and no tool calls present"
                         )
                 usage_data = response.usage
-                cached_tokens = 0
-                cache_write_tokens = 0
-                if (
-                    usage_data
-                    and hasattr(usage_data, "prompt_tokens_details")
-                    and usage_data.prompt_tokens_details
-                ):
-                    cached_tokens = (
-                        getattr(usage_data.prompt_tokens_details, "cached_tokens", 0)
-                        or 0
-                    )
-                    cache_write_tokens = (
-                        getattr(
-                            usage_data.prompt_tokens_details, "cache_write_tokens", 0
-                        )
-                        or 0
-                    )
-
-                usage = TokenUsage(
-                    prompt_tokens=usage_data.prompt_tokens if usage_data else 0,
-                    completion_tokens=usage_data.completion_tokens if usage_data else 0,
-                    cache_read_input_tokens=cached_tokens,
-                    cache_creation_input_tokens=cache_write_tokens,
-                )
+                usage = _parse_openai_usage(usage_data)
 
                 logger.info(
                     "llm.chat_completed",
@@ -605,8 +619,9 @@ class AzureBackend(LLMBackend):
                         "duration_ms": round(elapsed * 1000),
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
-                        "cached_tokens": cached_tokens,
-                        "cache_write_tokens": cache_write_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
+                        "cached_tokens": usage.cache_read_input_tokens,
+                        "cache_write_tokens": usage.cache_creation_input_tokens,
                     },
                 )
 
@@ -638,7 +653,7 @@ class AzureBackend(LLMBackend):
             f"Azure OpenAI chat failed after {self.MAX_RETRIES} retries: {last_exception}"
         ) from last_exception
 
-    async def embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
+    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
         """Generate embeddings via Azure OpenAI.
 
         Supported kwargs:
@@ -659,7 +674,12 @@ class AzureBackend(LLMBackend):
         embeddings = [item.embedding for item in response.data]
         dim = len(embeddings[0]) if embeddings else self.DEFAULT_EMBED_DIM
 
-        return EmbeddingResponse(embeddings=embeddings, model=deployment, dim=dim)
+        return EmbeddingResponse(
+            embeddings=embeddings,
+            model=deployment,
+            dim=dim,
+            usage=_parse_embed_usage(response),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -692,6 +712,11 @@ class AnthropicBackend(LLMBackend):
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def provider_name(self) -> str:
+        """Return the registry key for this backend."""
+        return "anthropic"
 
     @property
     def embedding_dim(self) -> int:
@@ -771,6 +796,9 @@ class AnthropicBackend(LLMBackend):
                 usage = TokenUsage(
                     prompt_tokens=response.usage.input_tokens,
                     completion_tokens=response.usage.output_tokens,
+                    # Thinking/output detail is folded into output_tokens by
+                    # the API; read a split best-effort, defaulting to zero.
+                    reasoning_tokens=getattr(response.usage, "thinking_tokens", 0) or 0,
                     cache_read_input_tokens=getattr(
                         response.usage, "cache_read_input_tokens", 0
                     )
@@ -819,7 +847,7 @@ class AnthropicBackend(LLMBackend):
             f"Anthropic chat failed after {self.MAX_RETRIES} retries: {last_exception}"
         ) from last_exception
 
-    async def embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
+    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
         """Embeddings are not supported by the Anthropic API."""
         raise NotImplementedError(
             "Anthropic does not offer a public embedding API. "
@@ -873,6 +901,11 @@ class OpenAILikeBackend(LLMBackend):
     @property
     def model_name(self) -> str:
         return self._chat_model
+
+    @property
+    def provider_name(self) -> str:
+        """Return the registry key for this backend."""
+        return "openai_like"
 
     @property
     def embedding_dim(self) -> int:
@@ -939,10 +972,7 @@ class OpenAILikeBackend(LLMBackend):
                             "OpenAI-like response content is None and no tool calls present"
                         )
                 usage_data = response.usage
-                usage = TokenUsage(
-                    prompt_tokens=usage_data.prompt_tokens if usage_data else 0,
-                    completion_tokens=usage_data.completion_tokens if usage_data else 0,
-                )
+                usage = _parse_openai_usage(usage_data)
 
                 logger.info(
                     "llm.chat_completed",
@@ -952,6 +982,9 @@ class OpenAILikeBackend(LLMBackend):
                         "duration_ms": round(elapsed * 1000),
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
+                        "cached_tokens": usage.cache_read_input_tokens,
+                        "cache_write_tokens": usage.cache_creation_input_tokens,
                     },
                 )
 
@@ -997,7 +1030,7 @@ class OpenAILikeBackend(LLMBackend):
             f"OpenAI-like chat failed after {self.MAX_RETRIES} retries: {last_exception}"
         ) from last_exception
 
-    async def embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
+    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
         """Generate embeddings via the OpenAI-compatible embeddings API.
 
         Supported kwargs:
@@ -1036,6 +1069,7 @@ class OpenAILikeBackend(LLMBackend):
             embeddings=embeddings,
             model=model,
             dim=dim,
+            usage=_parse_embed_usage(response),
         )
 
 

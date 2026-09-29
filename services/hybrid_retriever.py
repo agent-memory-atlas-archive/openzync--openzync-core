@@ -151,7 +151,7 @@ class HybridRetriever:
         # ── Embed the query once; both vector legs reuse this vector ──────
         # Embedding failure propagates as SearchLegFailedError(leg="embedding")
         # before any leg-level try/except can re-wrap it.
-        query_embedding = await self._embed_query(query)
+        query_embedding = await self._embed_query(query, project_id)
 
         # ── Run all three retrieval legs sequentially ─────────────────────
         # Each leg returns a list of dicts with at minimum ``id`` and
@@ -371,7 +371,9 @@ class HybridRetriever:
 
     # ── Vector Search ──────────────────────────────────────────────────────────
 
-    async def _embed_query(self, query: str) -> list[float]:
+    async def _embed_query(
+        self, query: str, project_id: UUID | None = None
+    ) -> list[float]:
         """Generate an embedding vector for a search query.
 
         Embeds with the frozen canonical model
@@ -381,6 +383,7 @@ class HybridRetriever:
 
         Args:
             query: Natural-language query text.
+            project_id: Project scope recorded on the metering row.
 
         Returns:
             A list of floats representing the query embedding.
@@ -395,9 +398,16 @@ class HybridRetriever:
                 validate_embedding_dim,
             )
             from core.llm import resolve_backend
+            from services.usage_service import make_sink
 
             org_config_dict = (
                 self._org_config.to_llm_config_dict() if self._org_config else None
+            )
+            sink = make_sink(
+                self._db,
+                org_id=self._org_id,
+                worker="query_embed",
+                project_id=project_id,
             )
             backend = await resolve_backend(
                 provider=self._org_config.embedding_backend
@@ -405,11 +415,12 @@ class HybridRetriever:
                 else None,
                 org_config=org_config_dict,
                 mode="embedding",
+                sink=sink,
             )
             model = resolve_embed_model(
                 self._org_config.embedding_backend if self._org_config else None
             )
-            response = await backend.embed([query], model=model)
+            response = await backend.embed([query], model=model, metered=True)
             if response.embeddings and len(response.embeddings) > 0:
                 query_embedding = response.embeddings[0]
                 validate_embedding_dim(
