@@ -8,7 +8,8 @@ Enables RLS with the standard org-isolation policy and adds the
 ``(organization_id, created_at)`` index for admin reads.
 
 Existing rows are backfilled: ``provider``/``reasoning_tokens`` default
-in place, and ``idempotency_key`` is minted per row before the NOT NULL
+in place, ``worker`` is copied from ``task_type`` where NULL, and
+``idempotency_key`` is minted per row before the NOT NULL
 + UNIQUE constraints are applied.
 
 Revision ID: 0058
@@ -62,6 +63,7 @@ def upgrade() -> None:
         "UPDATE llm_usage SET idempotency_key = gen_random_uuid()::text "
         "WHERE idempotency_key IS NULL"
     )
+    op.execute("UPDATE llm_usage SET worker = task_type WHERE worker IS NULL")
     op.alter_column("llm_usage", "idempotency_key", nullable=False)
     op.create_unique_constraint(
         "uq_llm_usage_idempotency_key", "llm_usage", ["idempotency_key"]

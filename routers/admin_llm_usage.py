@@ -33,7 +33,7 @@ router = APIRouter(
     tags=["Admin - LLM Usage"],
 )
 
-LLMUsageSortBy = Literal["created_at", "duration_ms", "model"]
+LLMUsageSortBy = Literal["created_at", "duration_ms", "model", "total_tokens"]
 """Whitelisted sort keys for the usage endpoint."""
 
 
@@ -112,7 +112,8 @@ async def list_llm_usage(
         model: Optional model identifier filter.
         limit: Max rows per page (1-500).
         offset: Pagination offset.
-        sort_by: Sort key (``created_at``, ``duration_ms``, ``model``).
+        sort_by: Sort key (``created_at``, ``duration_ms``, ``model``,
+            ``total_tokens``).
         sort_dir: Sort direction.
         db: Async database session.
         org_id: Authenticated organization ID (from JWT or API key).
