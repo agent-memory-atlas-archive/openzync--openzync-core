@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import audit_action
@@ -210,13 +210,17 @@ async def delete_schema(
     schema_id: UUID,
     service: SchemaService = Depends(_get_schema_service),
     org_id: str = Depends(require_permission("configuration:write")),
-) -> None:
+) -> Response:
     """Soft-delete a schema (set ``is_active`` to ``false``).
 
     Requires ``admin`` scope.  Existing extractions referencing this schema
     are preserved (FK uses ``ON DELETE SET NULL``).
     """
+    # note: explicit empty Response — implicit None makes FastAPI serialize
+    # a JSON `null` body on the 204, which uvicorn rejects and rolls back
+    # the delete in get_db teardown after 204 headers flush.
     await service.delete_schema(
         org_id=UUID(org_id),
         schema_id=schema_id,
     )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
