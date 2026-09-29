@@ -224,7 +224,7 @@ async def delete_project_memory(
     _: None = Depends(require_project_membership),
     _perm: None = Depends(require_permission("project:write")),
     actor: UUID = Depends(get_current_user_id),
-) -> None:
+) -> Response:
     """Delete all memory for a project.
 
     Soft-deletes all episodes (messages) and facts for the given project.
@@ -232,6 +232,9 @@ async def delete_project_memory(
     data is marked as inactive but preserved for a 30-day GDPR grace period
     before hard-purge. The ``confirm`` body must echo the path project ID.
     """
+    # note: explicit empty Response — implicit None makes FastAPI serialize
+    # a JSON `null` body on the 204, which uvicorn rejects and rolls back
+    # the wipe in get_db teardown after 204 headers flush.
     org_id = UUID(request.state.org_id)
     project_id = UUID(request.path_params["project_id"])
     await service.delete_project_memory(
@@ -240,3 +243,4 @@ async def delete_project_memory(
         confirm=body.confirm,
         actor_id=actor,
     )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

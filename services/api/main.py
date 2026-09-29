@@ -174,6 +174,7 @@ def create_app() -> FastAPI:
         yield
 
         # ── Shutdown (reverse order of initialisation) ────────────────────
+        await admin_metrics.close_prom_client()
         if getattr(app.state, "falkordb_client", None) is not None:
             await app.state.falkordb_client.connection.aclose()
         if getattr(app.state, "openbao_client", None) is not None:

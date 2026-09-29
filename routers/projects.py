@@ -356,15 +356,19 @@ async def remove_member(
     project_id: UUID = Path(...),
     user_id: UUID = Path(...),
     service: ProjectService = Depends(_get_project_service),
-) -> None:
+) -> Response:
     """Remove a user from a project.
 
     Requires owner role.  Cannot remove the last owner.
     """
+    # note: explicit empty Response — implicit None makes FastAPI serialize
+    # a JSON `null` body on the 204, which uvicorn rejects and rolls back
+    # the removal in get_db teardown after 204 headers flush.
     await service.remove_member(
         project_id=project_id,
         user_id=user_id,
     )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch(

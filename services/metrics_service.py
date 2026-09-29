@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from datetime import UTC, datetime, timedelta
 
@@ -96,7 +97,8 @@ QUEUE_QUERIES: list[tuple[str, str]] = [
 ALL_QUERIES = LATENCY_QUERIES + RATE_QUERIES + COUNTER_QUERIES + QUEUE_QUERIES
 
 # ── Range query definitions (for time-series charts) ─────────────────────────
-# These use [5m] rate windows and are queried over 24h with 1h step.
+# These use [5m] rate windows; the query_range window/step is caller-supplied
+# (get_summary defaults to last 24h, step max(1h, window/180)).
 
 RETRIEVAL_RANGE_QUERIES: dict[str, str] = {
     "context": "sum(rate(openzync_context_latency_seconds_count[5m]))",
@@ -175,7 +177,12 @@ class MetricsService:
     def __init__(self, prometheus_url: str) -> None:
         self._base_url = prometheus_url.rstrip("/")
 
-    async def get_summary(self, org_id: str | None = None) -> MetricsSummaryResponse:
+    async def get_summary(
+        self,
+        org_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> MetricsSummaryResponse:
         """Run all PromQL queries and assemble the response.
 
         Args:
@@ -183,6 +190,9 @@ class MetricsService:
                 or ``"anonymous"`` the original global queries are used
                 (backward compat for health checks). The admin route always
                 passes a real org_id.
+            start: Window start for the range time-series. Defaults to 24h
+                before ``end`` (or now) when omitted.
+            end: Window end for the range time-series. Defaults to now.
 
         Returns:
             A fully populated ``MetricsSummaryResponse``.
@@ -249,12 +259,20 @@ class MetricsService:
             raise MetricsUnavailableError("Prometheus is unreachable.") from exc
 
         # ── Range queries for time-series charts ────────────────────────────
-        now = datetime.now(UTC)
-        start_iso = (now - timedelta(hours=24)).isoformat()
-        end_iso = now.isoformat()
+        # ONLY the range queries below honor the window. Instant queries
+        # (latencies, rates, queue) above and _fetch_db_counts totals stay
+        # snapshot semantics.
+        _end = end if end is not None else datetime.now(UTC)
+        _start = start if start is not None else _end - timedelta(hours=24)
+        start_iso = _start.isoformat()
+        end_iso = _end.isoformat()
+        # Parity with routers/admin_metrics._prom_step: max(1h, window/180).
+        # Duplicated (not imported) — services must not import from routers.
+        _window_hours = (_end - _start).total_seconds() / 3600
+        _step = f"{max(1, math.ceil(_window_hours / 180))}h"
 
         async def _range_task(name: str, promql: str) -> tuple[str, list[dict]]:
-            vals = await self._fetch_range(promql, start_iso, end_iso)
+            vals = await self._fetch_range(promql, start_iso, end_iso, step=_step)
             return name, vals
 
         range_tasks = (
@@ -358,12 +376,15 @@ class MetricsService:
 
         # Scalar or vector result
         try:
-            return float(results[0]["value"][1])
+            value = float(results[0]["value"][1])
         except (KeyError, IndexError, ValueError) as exc:
             logger.error("metrics.unexpected_response_format", exc_info=True)
             raise MetricsUnavailableError(
                 "Unexpected Prometheus response format."
             ) from exc
+        # Prometheus histogram_quantile yields "NaN" on sparse/fresh
+        # buckets; float("NaN") does not raise but breaks JSON encoding.
+        return value if math.isfinite(value) else 0.0
 
     async def _fetch_range(
         self, promql: str, start: str, end: str, step: str = "1h"
@@ -408,10 +429,16 @@ class MetricsService:
             return []
 
         # Return the first series' values: [[timestamp, value], ...]
-        return [
-            {"timestamp": str(v[0]), "value": float(v[1])}
-            for v in results[0].get("values", [])
-        ]
+        # Non-finite ("NaN"/"Inf") points from sparse buckets → 0.0.
+        points: list[dict[str, str | float]] = []
+        for v in results[0].get("values", []):
+            point = float(v[1])
+            coerced = point if math.isfinite(point) else 0.0
+            # Prometheus returns Unix-epoch floats; downstream alignment and
+            # the frontend (new Date(...)) need ISO-8601 strings.
+            ts = datetime.fromtimestamp(float(v[0]), tz=UTC).isoformat()
+            points.append({"timestamp": ts, "value": coerced})
+        return points
 
     def _build_response(self, results: dict[str, float]) -> MetricsSummaryResponse:
         """Map raw PromQL results into the response model."""

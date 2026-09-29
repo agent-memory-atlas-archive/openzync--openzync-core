@@ -13,7 +13,7 @@ from __future__ import annotations
 from uuid import UUID
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import audit_action
@@ -164,7 +164,7 @@ async def revoke_api_key(
     _: None = Depends(require_project_membership),
     _perm: None = Depends(require_permission("project:manage")),
     org_id: str = Depends(require_org_id),
-) -> None:
+) -> Response:
     """Revoke (soft-delete) a project-scoped API key.
 
     Args:
@@ -177,6 +177,9 @@ async def revoke_api_key(
     Raises:
         NotFoundError: If the key does not exist in this project.
     """
+    # note: explicit empty Response — implicit None makes FastAPI serialize
+    # a JSON `null` body on the 204, which uvicorn rejects and rolls back
+    # the revoke in get_db teardown after 204 headers flush.
     revoked = await service.revoke_project_key(
         organization_id=UUID(org_id),
         project_id=project_id,
@@ -187,3 +190,4 @@ async def revoke_api_key(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"API key '{key_id}' not found in this project.",
         )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

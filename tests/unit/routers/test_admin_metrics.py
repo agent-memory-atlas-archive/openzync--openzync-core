@@ -1,6 +1,6 @@
 """Unit tests for the admin metrics router.
 
-Tests ``/metrics/summary``, ``/metrics/query``, and ``/metrics/targets``.
+Tests ``/metrics/summary``, ``/metrics/batch``, and ``/metrics/targets``.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dependencies.auth import require_org_id
 from dependencies.db import get_db
+from routers import admin_metrics
 from routers.admin_metrics import _get_metrics_service, router
 from schemas.admin_metrics import (
     EpisodeStats,
@@ -50,13 +51,26 @@ def _stub_permission_gate() -> None:
         yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_prom_client_singleton() -> None:
+    """Reset the lazy ``_prom_client`` singleton around every test.
+
+    ``routers.admin_metrics._get_prom_client`` caches a module-global
+    ``httpx.AsyncClient`` — without a reset, a client injected in one test
+    leaks into later tests (empty-targets saw 1 target, 502 saw 200).
+    """
+    admin_metrics._prom_client = None  # noqa: SLF001
+    yield
+    admin_metrics._prom_client = None  # noqa: SLF001
+
+
 def _create_app() -> tuple[FastAPI, AsyncMock]:
     """Build a minimal FastAPI app with the admin metrics router."""
     app = FastAPI()
     db_mock = AsyncMock(spec=AsyncSession)
     # Ensure execute() returns a sync mock so scalar() yields values, not coroutines
     db_mock.execute.return_value = MagicMock()
-    # /metrics/summary and /metrics/query depend on dependencies.org_config,
+    # /metrics/summary and /metrics/batch depend on dependencies.org_config,
     # which reads app.state.openbao_client + app.state.redis and raises
     # OpenBaoConnectionError when the client is missing (core/org_config.py:101).
     # Same app.state wiring as test_admin_gate_matrix / test_admin_system;
@@ -190,64 +204,108 @@ async def test_get_metrics_summary_no_data() -> None:
     assert body["users_total"] == 0
 
 
-# ── /metrics/query ──────────────────────────────────────────────────────────────
+# ── /metrics/batch ─────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_get_org_query_success() -> None:
-    """GET /metrics/query returns 200 with predefined query result."""
+async def test_get_metrics_batch_success() -> None:
+    """GET /metrics/batch returns 200 with the partial-OK envelope."""
     app, db_mock = _create_app()
     transport = ASGITransport(app=app)
 
-    # Mock DB result for episodes_per_day query — returns rows via scalars()
+    # Every DB handler iterates its ``db.execute()`` result; one shared
+    # mock serves all 12 concurrent handlers, so __iter__ hands out a
+    # fresh (date, count) iterator per call.
     mock_result = MagicMock()
-    mock_result.__iter__ = MagicMock(
-        return_value=iter(
-            [
-                MagicMock(date="2026-08-18", count=42),
-                MagicMock(date="2026-08-17", count=38),
-            ]
-        )
+    mock_result.__iter__.side_effect = lambda: iter(
+        [
+            SimpleNamespace(date="2026-08-18", count=42),
+            SimpleNamespace(date="2026-08-17", count=38),
+        ]
     )
     db_mock.execute.return_value = mock_result
 
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get(
-            "/metrics/query", params={"query": "episodes_per_day", "days": 7}
-        )
+    # Prometheus is external I/O — fail it fast so the 3 Prom handlers
+    # land in ``errors`` (partial-OK) instead of hitting the network.
+    mock_prom = AsyncMock()
+    mock_prom.get.side_effect = httpx.ConnectError("Connection refused")
+
+    with patch("routers.admin_metrics._get_prom_client", return_value=mock_prom):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/metrics/batch", params={"days": 7})
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["query"] == "episodes_per_day"
-    assert body["org_scoped"] is True
-    assert "columns" in body
-    assert "rows" in body
+    assert set(body) == {"results", "errors", "meta"}
+    entry = body["results"]["episodes_per_day"]
+    assert entry["query"] == "episodes_per_day"
+    assert entry["org_scoped"] is True
+    assert entry["columns"] == ["date", "count"]
+    assert entry["rows"] == [["2026-08-18", 42], ["2026-08-17", 38]]
+    assert entry["total"] == 2
+    assert "parameters" in entry
+    assert body["meta"]["days"] == 7
+    assert body["meta"]["partial"] is True
+    # Partial-OK: the Prometheus handlers failed into ``errors`` (HTTP 200).
+    assert {
+        "error_rate_by_day",
+        "latency_percentiles",
+        "context_retrieval_rate",
+    } <= {e["query"] for e in body["errors"]}
 
 
 @pytest.mark.asyncio
-async def test_get_org_query_unknown_returns_422() -> None:
-    """GET /metrics/query returns 422 for unknown query name."""
+async def test_get_metrics_batch_invalid_days_returns_422() -> None:
+    """GET /metrics/batch returns 422 when days is not one of 7/30/90."""
     app, _ = _create_app()
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/metrics/query", params={"query": "nonexistent_query"})
+        resp = await client.get("/metrics/batch", params={"days": 5})
 
     assert resp.status_code == 422
-    body = resp.json()
-    assert "detail" in body
+    assert resp.json()["detail"] == "days must be one of 7, 30, 90."
 
 
 @pytest.mark.asyncio
-async def test_get_org_query_invalid_project_id_returns_422() -> None:
+async def test_get_metrics_batch_days_and_range_returns_422() -> None:
+    """GET /metrics/batch returns 422 when days is combined with from/to."""
+    app, _ = _create_app()
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/metrics/batch",
+            params={"days": 7, "from": "2026-08-01", "to": "2026-08-08"},
+        )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Pass either days or from/to, not both."
+
+
+@pytest.mark.asyncio
+async def test_get_metrics_batch_from_without_to_returns_422() -> None:
+    """GET /metrics/batch returns 422 when from is passed without to."""
+    app, _ = _create_app()
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/metrics/batch", params={"from": "2026-08-01"})
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "Pass either days or both from and to."
+
+
+@pytest.mark.asyncio
+async def test_get_metrics_batch_invalid_project_id_returns_422() -> None:
     """Non-UUID project_id → 422 (typed ``UUID | None`` Query validation)."""
     app, _ = _create_app()
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get(
-            "/metrics/query",
-            params={"query": "episodes_per_day", "project_id": "not-a-uuid"},
+            "/metrics/batch",
+            params={"days": 7, "project_id": "not-a-uuid"},
         )
 
     assert resp.status_code == 422
@@ -257,36 +315,38 @@ async def test_get_org_query_invalid_project_id_returns_422() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_org_query_with_valid_project_id_returns_200() -> None:
+async def test_get_metrics_batch_with_valid_project_id_returns_200() -> None:
     """Valid UUID project_id is passed through to the handler (still 200)."""
     app, db_mock = _create_app()
     transport = ASGITransport(app=app)
 
-    # Same row shape as test_get_org_query_success — handler iterates `result`.
+    # Same row shape as test_get_metrics_batch_success — the handler
+    # iterates `result`.
     mock_result = MagicMock()
-    mock_result.__iter__ = MagicMock(
-        return_value=iter(
-            [
-                MagicMock(date="2026-08-18", count=42),
-            ]
-        )
+    mock_result.__iter__.side_effect = lambda: iter(
+        [
+            SimpleNamespace(date="2026-08-18", count=42),
+        ]
     )
     db_mock.execute.return_value = mock_result
 
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get(
-            "/metrics/query",
-            params={
-                "query": "episodes_per_day",
-                "days": 7,
-                "project_id": str(PROJECT_ID),
-            },
-        )
+    mock_prom = AsyncMock()
+    mock_prom.get.side_effect = httpx.ConnectError("Connection refused")
+
+    with patch("routers.admin_metrics._get_prom_client", return_value=mock_prom):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/metrics/batch",
+                params={
+                    "days": 7,
+                    "project_id": str(PROJECT_ID),
+                },
+            )
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["query"] == "episodes_per_day"
-    assert body["rows"] == [["2026-08-18", 42]]
+    assert body["results"]["episodes_per_day"]["query"] == "episodes_per_day"
+    assert body["results"]["episodes_per_day"]["rows"] == [["2026-08-18", 42]]
 
 
 # ── /metrics/targets ────────────────────────────────────────────────────────────
@@ -314,12 +374,10 @@ async def test_get_prometheus_targets_success() -> None:
         },
     }
 
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.get.return_value = mock_response
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_prom = AsyncMock()
+    mock_prom.get.return_value = mock_response
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch("routers.admin_metrics._get_prom_client", return_value=mock_prom):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.get("/metrics/targets")
 
@@ -344,12 +402,10 @@ async def test_get_prometheus_targets_empty() -> None:
         "data": {"activeTargets": []},
     }
 
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.get.return_value = mock_response
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_prom = AsyncMock()
+    mock_prom.get.return_value = mock_response
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch("routers.admin_metrics._get_prom_client", return_value=mock_prom):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.get("/metrics/targets")
 
@@ -365,12 +421,10 @@ async def test_get_prometheus_targets_502() -> None:
     app, _ = _create_app()
     transport = ASGITransport(app=app)
 
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.get.side_effect = httpx.ConnectError("Connection refused")
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_prom = AsyncMock()
+    mock_prom.get.side_effect = httpx.ConnectError("Connection refused")
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
+    with patch("routers.admin_metrics._get_prom_client", return_value=mock_prom):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.get("/metrics/targets")
 

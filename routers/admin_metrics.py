@@ -5,16 +5,30 @@ DB-sourced counts with Prometheus-backed latency/error metrics.
 
 Endpoints:
     GET /metrics/summary   — Aggregated RED + DB metrics for the admin panel
-    GET /metrics/queries   — List available predefined metric queries
-    GET /metrics/query     — Run a predefined org-scoped metric query
     GET /metrics/targets   — List Prometheus scrape targets and health
+    GET /metrics/batch     — Run all 12 predefined queries at once (partial OK)
+
+    ``GET /metrics/batch`` takes EITHER ``days`` (one of 7/30/90, window is
+    ``[now-days, now)``) OR ``from``+``to`` (``YYYY-MM-DD``, window is
+    ``[from 00:00 UTC, to 00:00 UTC + 1 day)``). The styles are mutually
+    exclusive — mixing them, omitting both, or ``from >= to`` is a 422.
+    Every handler filters on the explicit ``[start, end)`` window.
+
+The single-query surface (``GET /metrics/queries``, ``GET /metrics/query``)
+was removed — the dashboard renders every predefined query in one batched
+call instead of fanning out N single-query requests.
 
 All endpoints require API key or JWT authentication.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time, timedelta
+import asyncio
+import math
+import time
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dtime
+from typing import Any
 from uuid import UUID
 
 import httpx
@@ -24,10 +38,11 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import get_settings
-from core.exceptions import GraphBackendUnavailableError
+from core.exceptions import GraphBackendUnavailableError, MetricsUnavailableError
 from dependencies.auth import require_permission
 from dependencies.db import get_db
 from dependencies.org_config import get_org_config
+from models.audit_log import AuditLog
 from models.episode import Episode
 from models.fact import Fact
 from models.project import Project
@@ -106,6 +121,34 @@ def _get_metrics_service() -> MetricsService:
     return MetricsService(prometheus_url=get_settings().PROMETHEUS_URL)
 
 
+# ── Shared Prometheus client ──────────────────────────────────────────────────
+# ⚠️ One module-level client reused by every Prom helper/targets call.
+# Per-call ``async with httpx.AsyncClient()`` opens a new connection pool per
+# query — under /metrics/batch (12 handlers, 4 hitting Prom) that is 4 pools
+# per request. Per-request timeouts still override the default below.
+
+_prom_client: httpx.AsyncClient | None = None
+
+
+def _get_prom_client() -> httpx.AsyncClient:
+    """Return the shared Prometheus HTTP client (lazy singleton)."""
+    global _prom_client
+    if _prom_client is None:
+        _prom_client = httpx.AsyncClient(timeout=10.0)
+    return _prom_client
+
+
+async def close_prom_client() -> None:
+    """Close the shared Prometheus HTTP client (lifespan shutdown).
+
+    Safe to call when the client was never created — a no-op in that case.
+    """
+    global _prom_client
+    if _prom_client is not None:
+        await _prom_client.aclose()
+        _prom_client = None
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
@@ -122,6 +165,25 @@ def _get_metrics_service() -> MetricsService:
 )
 async def get_metrics_summary(
     request: Request,
+    days: int | None = Query(
+        default=None,
+        description="Look-back window — one of 7/30/90. "
+        "Mutually exclusive with from/to. "
+        "Omit all window params for the last 24h.",
+    ),
+    from_date: str | None = Query(
+        default=None,
+        alias="from",
+        description="Start date YYYY-MM-DD inclusive (00:00 UTC). "
+        "Requires to; mutually exclusive with days.",
+    ),
+    to_date: str | None = Query(
+        default=None,
+        alias="to",
+        description="End date YYYY-MM-DD inclusive "
+        "(window ends to 00:00 UTC + 1 day). "
+        "Requires from; mutually exclusive with days.",
+    ),
     db: AsyncSession = Depends(get_db),
     org_id: str = Depends(require_permission("members:read")),
     org_config: OrgConfigBase = Depends(get_org_config),
@@ -131,7 +193,46 @@ async def get_metrics_summary(
 
     Merges DB counts and Prometheus metrics into a single response.
     DB counts are scoped to the authenticated organization.
+    Only the Prometheus range time-series honor the window; DB totals
+    and instant queries stay snapshot semantics.
     """
+    if days is not None and (from_date is not None or to_date is not None):
+        raise HTTPException(
+            status_code=422,
+            detail="Pass either days or from/to, not both.",
+        )
+    if days is not None:
+        if days not in (7, 30, 90):
+            raise HTTPException(
+                status_code=422,
+                detail="days must be one of 7, 30, 90.",
+            )
+        end = datetime.now(UTC)
+        start = end - timedelta(days=days)
+    elif from_date is not None or to_date is not None:
+        if from_date is None or to_date is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Pass either days or both from and to.",
+            )
+        try:
+            from_day = date.fromisoformat(from_date)
+            to_day = date.fromisoformat(to_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="from/to must be YYYY-MM-DD.",
+            ) from exc
+        if from_day >= to_day:
+            raise HTTPException(
+                status_code=422,
+                detail="from must be earlier than to.",
+            )
+        start = datetime.combine(from_day, dtime.min, tzinfo=UTC)
+        end = datetime.combine(to_day, dtime.min, tzinfo=UTC) + timedelta(days=1)
+    else:
+        end = datetime.now(UTC)
+        start = end - timedelta(hours=24)
     org_uuid = UUID(org_id)
     backend = await _resolve_graph_backend(request, db, org_config, org_uuid)
 
@@ -141,7 +242,25 @@ async def get_metrics_summary(
     )
 
     # ── Prometheus metrics (org-scoped) ──────────────────────────────────
-    perf = await prom.get_summary(org_id=str(org_uuid))
+    # Degraded mode: a down Prometheus must not take down the summary —
+    # DB counts are still returned with Prometheus fields at defaults.
+    # Only MetricsUnavailableError is caught; every other exception
+    # propagates to the global handler.
+    try:
+        perf = await prom.get_summary(org_id=str(org_uuid), start=start, end=end)
+    except MetricsUnavailableError as exc:
+        logger.warning(
+            "admin_metrics.prometheus_degraded",
+            org_id=str(org_uuid),
+            error=str(exc),
+        )
+        return MetricsSummaryResponse(
+            episodes=episode_stats,
+            graphs=graph_stats,
+            users_total=user_count,
+            status="degraded",
+            message=f"Prometheus unreachable: {exc}",
+        )
 
     # Overwrite DB fields into the response
     perf.episodes = episode_stats
@@ -149,6 +268,75 @@ async def get_metrics_summary(
     perf.users_total = user_count
 
     return perf
+
+
+@router.get(
+    "/targets",
+    summary="Prometheus scrape targets",
+    description=(
+        "Lists all Prometheus scrape targets and their current health. "
+        "Useful for the admin panel's health indicator.  Returns 502 if "
+        "Prometheus is unreachable."
+    ),
+)
+async def get_prometheus_targets(
+    _org_id: str = Depends(require_permission("members:read")),
+    sort_by: MonitorTargetSortBy | None = Query(
+        default=None,
+        description="Sort key — ``name`` (job), ``created_at`` "
+        "(last_scrape), ``type`` (instance), ``status`` (health).",
+    ),
+    sort_dir: SortDir = Query(
+        default="asc",
+        description="Sort direction (default asc).",
+    ),
+) -> dict:
+    """Get Prometheus scrape target health.
+
+    Default order is the Prometheus response order (preserved); sort keys
+    map to target fields (``name``→job, ``created_at``→last_scrape,
+    ``type``→instance, ``status``→health).
+
+    Returns:
+        Dict with ``targets`` list and ``status``.
+    """
+    base_url = get_settings().PROMETHEUS_URL.rstrip("/")
+    try:
+        resp = await _get_prom_client().get(
+            f"{base_url}/api/v1/targets", timeout=3.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Prometheus targets unavailable: {exc}",
+        ) from exc
+
+    targets = []
+    for t in data.get("data", {}).get("activeTargets", []):
+        targets.append({
+            "job": t.get("labels", {}).get("job", ""),
+            "instance": t.get("labels", {}).get("instance", ""),
+            "health": t.get("health", "unknown"),
+            "last_scrape": t.get("lastScrape", ""),
+            "last_error": t.get("lastError", "") or None,
+        })
+
+    if sort_by is not None:
+        # note: explicit key selection — no getattr on raw input.
+        def _target_key(target: dict) -> tuple[str, str]:
+            if sort_by == "name":
+                return (target["job"], target["instance"])
+            if sort_by == "created_at":
+                return (target["last_scrape"], target["job"])
+            if sort_by == "type":
+                return (target["instance"], target["job"])
+            return (target["health"], target["job"])
+
+        targets.sort(key=_target_key, reverse=(sort_dir == "desc"))
+
+    return {"status": "ok", "targets": targets}
 
 
 # ── Predefined query helpers ──────────────────────────────────────────────
@@ -189,12 +377,11 @@ def _result(
 async def _prom_instant(promql: str) -> float:
     """Run a PromQL instant query and return the scalar value."""
     base_url = get_settings().PROMETHEUS_URL.rstrip("/")
-    async with httpx.AsyncClient(timeout=5) as client:
-        resp = await client.get(
-            f"{base_url}/api/v1/query", params={"query": promql}
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await _get_prom_client().get(
+        f"{base_url}/api/v1/query", params={"query": promql}, timeout=5.0
+    )
+    resp.raise_for_status()
+    data = resp.json()
     if data["status"] != "success":
         raise HTTPException(
             status_code=502,
@@ -203,22 +390,33 @@ async def _prom_instant(promql: str) -> float:
     results = data["data"]["result"]
     if not results:
         return 0.0
-    return float(results[0]["value"][1])
+    value = float(results[0]["value"][1])
+    # histogram_quantile yields "NaN" on sparse/fresh buckets — not JSON compliant.
+    return value if math.isfinite(value) else 0.0
 
 
-async def _prom_range(promql: str, days: int) -> list[list]:
+def _prom_step(start: datetime, end: datetime) -> str:
+    """Range step capped at ~180 points: ``max(1h, window/180)``."""
+    window_hours = (end - start).total_seconds() / 3600
+    hours = max(1, math.ceil(window_hours / 180))
+    return f"{hours}h"
+
+
+async def _prom_range(promql: str, start: datetime, end: datetime) -> list[list]:
     """Run a PromQL range query and return rows as [[timestamp, value]]."""
     base_url = get_settings().PROMETHEUS_URL.rstrip("/")
-    now = datetime.now(UTC)
-    start = (now - timedelta(days=days)).isoformat()
-    end = now.isoformat()
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{base_url}/api/v1/query_range",
-            params={"query": promql, "start": start, "end": end, "step": "1h"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await _get_prom_client().get(
+        f"{base_url}/api/v1/query_range",
+        params={
+            "query": promql,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "step": _prom_step(start, end),
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
     if data["status"] != "success":
         raise HTTPException(
             status_code=502,
@@ -227,25 +425,50 @@ async def _prom_range(promql: str, days: int) -> list[list]:
     results = data["data"]["result"]
     if not results:
         return []
-    return [[str(v[0]), float(v[1])] for v in results[0].get("values", [])]
+    rows: list[list] = []
+    for v in results[0].get("values", []):
+        point = float(v[1])
+        # Prometheus returns Unix-epoch floats; frontend parses with
+        # new Date(...), which needs ISO-8601 strings.
+        ts = datetime.fromtimestamp(float(v[0]), tz=UTC).isoformat()
+        rows.append([ts, point if math.isfinite(point) else 0.0])
+    return rows
 
 
 # ── DB query handlers ─────────────────────────────────────────────────────
 
 
-async def _episodes_per_day(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+async def _episodes_per_day_core(
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    project_id: UUID | None,
+    query_name: str,
 ) -> dict:
+    """Shared episodes/messages-per-day core — one query, two aliases.
+
+    Episodes are message turns, so ``messages_per_day`` is the same query
+    shape with a different ``query`` label (kept as a separate key so the
+    dashboard can chart both without client-side renaming).
+
+    Window is the explicit ``[start, end)`` — ORM comparisons bind
+    ``start``/``end`` as parameters, so the window never interpolates
+    request input into SQL text.
+    """
     conditions = [
         Episode.organization_id == org_uuid,
         Episode.is_deleted.is_(False),
-        Episode.created_at >= func.now() - text(f"interval '{days} days'"),
+        Episode.created_at >= start,
+        Episode.created_at < end,
     ]
     if project_id:
         conditions.append(Episode.project_id == project_id)
     stmt = (
         select(
-            func.date_trunc("day", Episode.created_at).label("date"),
+            func.date_trunc("day", Episode.created_at.op("AT TIME ZONE")("UTC")).label(
+                "date"
+            ),
             func.count(Episode.id).label("count"),
         )
         .select_from(Episode)
@@ -255,61 +478,73 @@ async def _episodes_per_day(
     )
     result = await db.execute(stmt)
     rows = [[str(r.date), r.count] for r in result]
-    return _result("episodes_per_day", True, ["date", "count"], rows, {"days": days})
+    params = {"from": start.isoformat(), "to": end.isoformat()}
+    return _result(query_name, True, ["date", "count"], rows, params)
+
+
+async def _episodes_per_day(
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
+) -> dict:
+    return await _episodes_per_day_core(
+        db, org_uuid, start, end, project_id, "episodes_per_day"
+    )
 
 
 async def _messages_per_day(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
-    # Episodes = message turns; same query shape as episodes_per_day
-    conditions = [
-        Episode.organization_id == org_uuid,
-        Episode.is_deleted.is_(False),
-        Episode.created_at >= func.now() - text(f"interval '{days} days'"),
-    ]
-    if project_id:
-        conditions.append(Episode.project_id == project_id)
-    stmt = (
-        select(
-            func.date_trunc("day", Episode.created_at).label("date"),
-            func.count(Episode.id).label("count"),
-        )
-        .select_from(Episode)
-        .where(*conditions)
-        .group_by(text("date"))
-        .order_by(text("date DESC"))
+    return await _episodes_per_day_core(
+        db, org_uuid, start, end, project_id, "messages_per_day"
     )
-    result = await db.execute(stmt)
-    rows = [[str(r.date), r.count] for r in result]
-    return _result("messages_per_day", True, ["date", "count"], rows, {"days": days})
 
 
-async def _users_per_day(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+async def _activity_per_day(
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
+    # AuditLog has no project column — project_id is explicitly ignored.
+    _ = project_id
     stmt = (
         select(
-            func.date_trunc("day", User.created_at).label("date"),
-            func.count(User.id).label("count"),
+            func.date_trunc("day", AuditLog.created_at.op("AT TIME ZONE")("UTC")).label(
+                "date"
+            ),
+            func.count(AuditLog.id).label("count"),
         )
-        .select_from(User)
+        .select_from(AuditLog)
         .where(
-            User.organization_id == org_uuid,
-            User.is_deleted.is_(False),
-            User.created_at >= func.now() - text(f"interval '{days} days'"),
+            AuditLog.organization_id == org_uuid,
+            AuditLog.created_at >= start,
+            AuditLog.created_at < end,
         )
         .group_by(text("date"))
         .order_by(text("date DESC"))
     )
     result = await db.execute(stmt)
     rows = [[str(r.date), r.count] for r in result]
-    return _result("users_per_day", True, ["date", "count"], rows, {"days": days})
+    params = {"from": start.isoformat(), "to": end.isoformat()}
+    return _result("activity_per_day", True, ["date", "count"], rows, params)
 
 
 async def _entities_per_day(
     db: AsyncSession,
     org_uuid: UUID,
-    days: int,
+    start: datetime,
+    end: datetime,
     limit: int,
     project_id: UUID | None,
     backend: GraphBackend | None = None,
@@ -319,34 +554,42 @@ async def _entities_per_day(
     project_ids = await stats.resolve_project_ids(
         org_uuid, project_id, include_archived=True
     )
-    cutoff = datetime.now(UTC) - timedelta(days=days)
     per_day = await stats.entity_counts_per_day(
-        org_uuid, project_ids, cutoff, None
+        org_uuid, project_ids, start, end
     )
     # Row shape preserved: [[<midnight-UTC datetime str>, count]], newest first
     # (matches the old date_trunc PG output format).
     rows = [
         [
-            str(datetime.combine(date.fromisoformat(day), time.min, tzinfo=UTC)),
+            str(datetime.combine(date.fromisoformat(day), dtime.min, tzinfo=UTC)),
             count,
         ]
         for day, count in sorted(per_day.items(), reverse=True)
     ]
-    return _result("entities_per_day", True, ["date", "count"], rows, {"days": days})
+    params = {"from": start.isoformat(), "to": end.isoformat()}
+    return _result("entities_per_day", True, ["date", "count"], rows, params)
 
 
 async def _facts_per_day(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
     conditions = [
         Fact.organization_id == org_uuid,
-        Fact.created_at >= func.now() - text(f"interval '{days} days'"),
+        Fact.created_at >= start,
+        Fact.created_at < end,
     ]
     if project_id:
         conditions.append(Fact.project_id == project_id)
     stmt = (
         select(
-            func.date_trunc("day", Fact.created_at).label("date"),
+            func.date_trunc("day", Fact.created_at.op("AT TIME ZONE")("UTC")).label(
+                "date"
+            ),
             func.count(Fact.id).label("count"),
         )
         .select_from(Fact)
@@ -356,12 +599,20 @@ async def _facts_per_day(
     )
     result = await db.execute(stmt)
     rows = [[str(r.date), r.count] for r in result]
-    return _result("facts_per_day", True, ["date", "count"], rows, {"days": days})
+    params = {"from": start.isoformat(), "to": end.isoformat()}
+    return _result("facts_per_day", True, ["date", "count"], rows, params)
 
 
 async def _enrichment_progress(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
+    # Snapshot metric — the [start, end) window is explicitly ignored.
+    _ = (start, end)
     # Progress metric — archived projects are excluded because the episode
     # workers early-return on them, so those rows are terminal, not pending.
     conditions = [
@@ -398,11 +649,14 @@ async def _enrichment_progress(
 async def _top_projects_by_episodes(
     db: AsyncSession,
     org_uuid: UUID,
-    days: int,
+    start: datetime,
+    end: datetime,
     limit: int,
     project_id: UUID | None,
     include_archived: bool = False,
 ) -> dict:
+    # Snapshot ranking — the [start, end) window is explicitly ignored.
+    _ = (start, end)
     # Volume metric — archiving preserves episodes, so archived projects are
     # excluded by default (like every other ranking here) but each row still
     # carries the flag, and ``include_archived`` lets the dashboard show them.
@@ -416,31 +670,38 @@ async def _top_projects_by_episodes(
         conditions.append(Project.is_archived.is_(False))
     stmt = (
         select(
-            Episode.project_id,
+            Project.name.label("project_name"),
             func.count(Episode.id).label("episode_count"),
             Project.is_archived.label("is_archived"),
         )
         .select_from(Episode)
         .join(Project, Project.id == Episode.project_id)
         .where(*conditions)
-        .group_by(Episode.project_id, Project.is_archived)
+        .group_by(Project.id, Project.name, Project.is_archived)
         .order_by(text("episode_count DESC"))
         .limit(limit)
     )
     result = await db.execute(stmt)
-    rows = [[str(r.project_id), r.episode_count, r.is_archived] for r in result]
+    rows = [[r.project_name, r.episode_count, r.is_archived] for r in result]
     return _result(
         "top_projects_by_episodes",
         True,
-        ["project_id", "episode_count", "is_archived"],
+        ["project_name", "episode_count", "is_archived"],
         rows,
         {"limit": limit, "include_archived": include_archived},
     )
 
 
 async def _top_users_by_messages(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
+    # Snapshot ranking — the [start, end) window is explicitly ignored.
+    _ = (start, end)
     conditions = [
         Episode.organization_id == org_uuid,
         Episode.is_deleted.is_(False),
@@ -449,21 +710,28 @@ async def _top_users_by_messages(
         conditions.append(Episode.project_id == project_id)
     stmt = (
         select(
-            Episode.user_id,
+            func.coalesce(
+                func.nullif(User.name, ""),
+                func.nullif(User.email, ""),
+            ).label("user"),
+            User.id.label("user_id"),
             func.count(Episode.id).label("message_count"),
         )
         .select_from(Episode)
-        .where(*conditions)
-        .group_by(Episode.user_id)
+        .join(User, User.id == Episode.user_id)
+        .where(User.organization_id == org_uuid, *conditions)
+        .group_by(User.id, User.name, User.email)
         .order_by(text("message_count DESC"))
         .limit(limit)
     )
     result = await db.execute(stmt)
-    rows = [[str(r.user_id), r.message_count] for r in result]
+    # note: COALESCE yields NULL only when both name and email are NULL/'';
+    # the ``or`` fallback keeps the display column never null/empty.
+    rows = [[r.user or str(r.user_id), r.message_count] for r in result]
     return _result(
         "top_users_by_messages",
         True,
-        ["user_id", "message_count"],
+        ["user", "message_count"],
         rows,
         {"limit": limit},
     )
@@ -473,18 +741,34 @@ async def _top_users_by_messages(
 
 
 async def _error_rate_by_day(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
+    # Prometheus has no project scope — project_id is explicitly ignored.
+    _ = (project_id, limit)
     promql = f'sum(increase(openzync_http_requests_total{{status="5xx",org_id="{org_uuid}"}}[1d]))'
-    rows = await _prom_range(promql, days)
+    rows = await _prom_range(promql, start, end)
+    params = {"from": start.isoformat(), "to": end.isoformat()}
     return _result(
-        "error_rate_by_day", True, ["timestamp", "value"], rows, {"days": days}
+        "error_rate_by_day", True, ["timestamp", "value"], rows, params
     )
 
 
 async def _latency_percentiles(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
+    # Instant snapshot — the [start, end) window is explicitly ignored, and
+    # Prometheus has no project scope so project_id is ignored too.
+    _ = (start, end, project_id, limit)
     queries = {
         "overall_p50": f'histogram_quantile(0.50, sum(rate(openzync_http_request_duration_seconds_bucket{{org_id="{org_uuid}"}}[5m])) by (le)) * 1000',
         "overall_p95": f'histogram_quantile(0.95, sum(rate(openzync_http_request_duration_seconds_bucket{{org_id="{org_uuid}"}}[5m])) by (le)) * 1000',
@@ -496,17 +780,25 @@ async def _latency_percentiles(
         "graph_p95": f'histogram_quantile(0.95, sum(rate(openzync_graph_search_latency_seconds_bucket{{org_id="{org_uuid}"}}[5m])) by (le)) * 1000',
         "graph_p99": f'histogram_quantile(0.99, sum(rate(openzync_graph_search_latency_seconds_bucket{{org_id="{org_uuid}"}}[5m])) by (le)) * 1000',
     }
-    rows = []
-    for name, promql in queries.items():
-        val = await _prom_instant(promql)
-        rows.append([name, round(val, 1)])
+    # ⚠️ Was 9 sequential awaits (~9 RTTs); one gather pays a single RTT.
+    values = await asyncio.gather(
+        *(_prom_instant(promql) for promql in queries.values())
+    )
+    rows = [
+        [name, round(val, 1)] for name, val in zip(queries.keys(), values, strict=True)
+    ]
     return _result(
         "latency_percentiles", True, ["metric", "value_ms"], rows, {}
     )
 
 
 async def _queue_depth_over_time(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
     # Was Prometheus, now DB: pending enrichments (bits 0-5 not all set)
     # per day
@@ -519,13 +811,16 @@ async def _queue_depth_over_time(
         (Episode.enrichment_status.op("&")(ENRICHMENT_ALL))
         != ENRICHMENT_ALL,
         Episode.project_id.not_in(archived_project_ids()),
-        Episode.created_at >= func.now() - text(f"interval '{days} days'"),
+        Episode.created_at >= start,
+        Episode.created_at < end,
     ]
     if project_id:
         conditions.append(Episode.project_id == project_id)
     stmt = (
         select(
-            func.date_trunc("day", Episode.created_at).label("date"),
+            func.date_trunc("day", Episode.created_at.op("AT TIME ZONE")("UTC")).label(
+                "date"
+            ),
             func.count(Episode.id).label("count"),
         )
         .select_from(Episode)
@@ -535,16 +830,25 @@ async def _queue_depth_over_time(
     )
     result = await db.execute(stmt)
     rows = [[str(r.date), r.count] for r in result]
-    return _result("queue_depth_over_time", True, ["date", "count"], rows, {"days": days})
+    params = {"from": start.isoformat(), "to": end.isoformat()}
+    return _result("queue_depth_over_time", True, ["date", "count"], rows, params)
 
 
 async def _context_retrieval_rate(
-    db: AsyncSession, org_uuid: UUID, days: int, limit: int, project_id: UUID | None
+    db: AsyncSession,
+    org_uuid: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    project_id: UUID | None,
 ) -> dict:
+    # Prometheus has no project scope — project_id is explicitly ignored.
+    _ = (project_id, limit)
     promql = f'sum(rate(openzync_context_latency_seconds_count{{org_id="{org_uuid}"}}[5m]))'
-    rows = await _prom_range(promql, days)
+    rows = await _prom_range(promql, start, end)
+    params = {"from": start.isoformat(), "to": end.isoformat()}
     return _result(
-        "context_retrieval_rate", True, ["timestamp", "rate"], rows, {"days": days}
+        "context_retrieval_rate", True, ["timestamp", "rate"], rows, params
     )
 
 
@@ -553,7 +857,7 @@ async def _context_retrieval_rate(
 _QUERY_HANDLERS = {
     "episodes_per_day": _episodes_per_day,
     "messages_per_day": _messages_per_day,
-    "users_per_day": _users_per_day,
+    "activity_per_day": _activity_per_day,
     "entities_per_day": _entities_per_day,
     "facts_per_day": _facts_per_day,
     "enrichment_progress": _enrichment_progress,
@@ -565,153 +869,208 @@ _QUERY_HANDLERS = {
     "context_retrieval_rate": _context_retrieval_rate,
 }
 
-AVAILABLE_QUERY_LIST: list[dict] = [
-    {"name": "episodes_per_day", "description": "Daily episode count", "category": "ingestion", "org_scoped": True, "params": ["days"]},
-    {"name": "messages_per_day", "description": "Daily message count", "category": "ingestion", "org_scoped": True, "params": ["days"]},
-    {"name": "users_per_day", "description": "Daily user creation", "category": "users", "org_scoped": True, "params": ["days"]},
-    {"name": "entities_per_day", "description": "Daily graph entity creation", "category": "graph", "org_scoped": True, "params": ["days"]},
-    {"name": "facts_per_day", "description": "Daily fact extraction", "category": "graph", "org_scoped": True, "params": ["days"]},
-    {"name": "enrichment_progress", "description": "Enrichment status breakdown", "category": "ingestion", "org_scoped": True, "params": []},
-    {"name": "top_projects_by_episodes", "description": "Projects ranked by episode count", "category": "projects", "org_scoped": True, "params": ["limit", "include_archived"]},
-    {"name": "top_users_by_messages", "description": "Users ranked by message count", "category": "users", "org_scoped": True, "params": ["limit"]},
-    {"name": "error_rate_by_day", "description": "Daily 5xx error counts", "category": "performance", "org_scoped": True, "params": ["days"]},
-    {"name": "latency_percentiles", "description": "Current p50/p95/p99 latency", "category": "performance", "org_scoped": True, "params": []},
-    {"name": "queue_depth_over_time", "description": "Pending enrichments per day (org backlog)", "category": "performance", "org_scoped": True, "params": ["days"]},
-    {"name": "context_retrieval_rate", "description": "Context assembly request rate", "category": "performance", "org_scoped": True, "params": ["days"]},
-]
+# Handlers hitting Prometheus (8s budget) vs DB (5s budget) in /metrics/batch.
+_PROM_QUERY_NAMES = frozenset(
+    {"error_rate_by_day", "latency_percentiles", "context_retrieval_rate"}
+)
 
 
-@router.get("/queries", summary="List available metric queries")
-async def list_queries() -> dict:
-    """Return the list of available predefined metric queries."""
-    return {"queries": AVAILABLE_QUERY_LIST}
+def _classify_batch_error(query_name: str, exc: BaseException) -> dict:
+    """Map a batch handler failure to the ``errors`` envelope entry."""
+    if isinstance(exc, HTTPException):
+        code = "bad_gateway" if exc.status_code == 502 else "handler_error"
+        message = str(exc.detail)
+    elif isinstance(exc, httpx.HTTPError):
+        # raise_for_status() in _prom_instant/_prom_range surfaces transport
+        # and status errors as httpx.HTTPError — Prometheus is down, not a
+        # handler bug, so report bad_gateway like the 502 HTTPException path.
+        code = "bad_gateway"
+        message = str(exc) or repr(exc)
+    elif isinstance(exc, TimeoutError):
+        code = "timeout"
+        message = f"Query '{query_name}' timed out"
+    else:
+        code = "handler_error"
+        message = str(exc) or repr(exc)
+    logger.warning(
+        "admin_metrics.batch_query_failed",
+        query=query_name,
+        code=code,
+        error=message,
+    )
+    return {"query": query_name, "code": code, "message": message}
 
 
 @router.get(
-    "/query",
-    summary="Run a predefined org-scoped metric query",
-    description="Runs a predefined query scoped to the authenticated organization.",
-)
-async def run_org_query(
-    request: Request,
-    query: str = Query(..., description="Query name (see /metrics/queries)"),
-    days: int = Query(default=7, ge=1, le=365, description="Look-back window in days"),
-    limit: int = Query(default=20, ge=1, le=100, description="Max results"),
-    project_id: UUID | None = Query(
-        default=None, description="Optional project UUID filter"
+    "/batch",
+    summary="Run all predefined metric queries at once",
+    description=(
+        "Runs all 12 predefined org-scoped queries concurrently over an "
+        "explicit ``[start, end)`` window and returns a partial-OK envelope: "
+        "per-query failures are reported in ``errors`` with HTTP 200, and "
+        "the failing ``results`` entry is omitted. Pass EITHER ``days`` "
+        "(one of 7/30/90, window ``[now-days, now)``) OR ``from``+``to`` "
+        "(``YYYY-MM-DD``, window ``[from 00:00 UTC, to 00:00 UTC + 1 day)``). "
+        "Per-query timeouts are 5s (DB) / 8s (Prometheus) with a "
+        "~15s overall budget."
     ),
+)
+async def get_metrics_batch(
+    request: Request,
+    days: int | None = Query(
+        default=None,
+        description="Look-back window — one of 7/30/90. "
+        "Mutually exclusive with from/to.",
+    ),
+    from_date: str | None = Query(
+        default=None,
+        alias="from",
+        description="Start date YYYY-MM-DD inclusive (00:00 UTC). "
+        "Requires to; mutually exclusive with days.",
+    ),
+    to_date: str | None = Query(
+        default=None,
+        alias="to",
+        description="End date YYYY-MM-DD inclusive "
+        "(window ends to 00:00 UTC + 1 day). "
+        "Requires from; mutually exclusive with days.",
+    ),
+    limit: int = Query(default=20, ge=1, le=50, description="Max rows for rankings"),
     include_archived: bool = Query(
         default=False,
-        description=(
-            "Include archived projects (top_projects_by_episodes only). "
-            "Archived is a soft delete, so volume metrics keep their data."
-        ),
+        description="Include archived projects (top_projects_by_episodes only).",
+    ),
+    project_id: UUID | None = Query(
+        default=None, description="Optional project filter"
     ),
     db: AsyncSession = Depends(get_db),
     org_id: str = Depends(require_permission("members:read")),
     org_config: OrgConfigBase = Depends(get_org_config),
-    prom: MetricsService = Depends(_get_metrics_service),
 ) -> dict:
-    """Run a predefined metric query scoped to the authenticated org.
-
-    All queries are org-scoped (Prometheus handlers filter by org_id label;
-    queue_depth_over_time is DB-backed pending enrichments per day).
-
-    ``include_archived`` applies to ``top_projects_by_episodes`` only; every
-    other handler accepts and ignores it.
-
-    Raises:
-        HTTPException: 422 if the query name is unknown.
-    """
-    handler = _QUERY_HANDLERS.get(query)
-    if not handler:
-        available = [q["name"] for q in AVAILABLE_QUERY_LIST]
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown query. Available: {available}",
-        )
-    if query == "entities_per_day":
-        # Only the entities handler needs the graph backend — resolved
-        # per-request like the context/search routers resolve theirs.
-        backend = await _resolve_graph_backend(
-            request, db, org_config, UUID(org_id)
-        )
-        return await _entities_per_day(db, UUID(org_id), days, limit, project_id, backend)
-    if query == "top_projects_by_episodes":
-        return await handler(
-            db, UUID(org_id), days, limit, project_id, include_archived
-        )
-    return await handler(db, UUID(org_id), days, limit, project_id)
-
-
-@router.get(
-    "/targets",
-    summary="Prometheus scrape targets",
-    description=(
-        "Lists all Prometheus scrape targets and their current health. "
-        "Useful for the admin panel's health indicator.  Returns 502 if "
-        "Prometheus is unreachable."
-    ),
-)
-async def get_prometheus_targets(
-    _org_id: str = Depends(require_permission("members:read")),
-    sort_by: MonitorTargetSortBy | None = Query(
-        default=None,
-        description="Sort key — ``name`` (job), ``created_at`` "
-        "(last_scrape), ``type`` (instance), ``status`` (health).",
-    ),
-    sort_dir: SortDir = Query(
-        default="asc",
-        description="Sort direction (default asc).",
-    ),
-) -> dict:
-    """Get Prometheus scrape target health.
-
-    Default order is the Prometheus response order (preserved); sort keys
-    map to target fields (``name``→job, ``created_at``→last_scrape,
-    ``type``→instance, ``status``→health).
+    """Run every predefined query concurrently; partial failures stay HTTP 200.
 
     Returns:
-        Dict with ``targets`` list and ``status``.
+        ``{"results": {name: query-dict}, "errors": [...], "meta": {...}}``
+        where each ``results`` value has ``query/org_scoped/columns/rows/
+        total/parameters`` and each ``errors`` entry has
+        ``query/code/message``. ``meta`` echoes the window as either
+        ``days`` or ``from``+``to``, plus ``limit``, ``duration_ms``,
+        and ``partial``.
     """
-    import httpx
-
-    base_url = get_settings().PROMETHEUS_URL.rstrip("/")
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{base_url}/api/v1/targets")
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as exc:
+    started = time.perf_counter()
+    if days is not None and (from_date is not None or to_date is not None):
         raise HTTPException(
-            status_code=502,
-            detail=f"Prometheus targets unavailable: {exc}",
-        ) from exc
+            status_code=422,
+            detail="Pass either days or from/to, not both.",
+        )
+    if days is not None:
+        if days not in (7, 30, 90):
+            raise HTTPException(
+                status_code=422,
+                detail="days must be one of 7, 30, 90.",
+            )
+        end = datetime.now(UTC)
+        start = end - timedelta(days=days)
+        window_meta: dict = {"days": days}
+    else:
+        if from_date is None or to_date is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Pass either days or both from and to.",
+            )
+        try:
+            from_day = date.fromisoformat(from_date)
+            to_day = date.fromisoformat(to_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="from/to must be YYYY-MM-DD.",
+            ) from exc
+        if from_day >= to_day:
+            raise HTTPException(
+                status_code=422,
+                detail="from must be earlier than to.",
+            )
+        start = datetime.combine(from_day, dtime.min, tzinfo=UTC)
+        end = datetime.combine(to_day, dtime.min, tzinfo=UTC) + timedelta(days=1)
+        window_meta = {"from": from_date, "to": to_date}
+    org_uuid = UUID(org_id)
+    backend = await _resolve_graph_backend(request, db, org_config, org_uuid)
 
-    targets = []
-    for t in data.get("data", {}).get("activeTargets", []):
-        targets.append({
-            "job": t.get("labels", {}).get("job", ""),
-            "instance": t.get("labels", {}).get("instance", ""),
-            "health": t.get("health", "unknown"),
-            "last_scrape": t.get("lastScrape", ""),
-            "last_error": t.get("lastError", "") or None,
-        })
+    async def _guarded(name: str, coro: Any) -> dict:
+        timeout = 8.0 if name in _PROM_QUERY_NAMES else 5.0
+        return await asyncio.wait_for(coro, timeout=timeout)
 
-    if sort_by is not None:
-        # note: explicit key selection — no getattr on raw input.
-        def _target_key(target: dict) -> tuple[str, str]:
-            if sort_by == "name":
-                return (target["job"], target["instance"])
-            if sort_by == "created_at":
-                return (target["last_scrape"], target["job"])
-            if sort_by == "type":
-                return (target["instance"], target["job"])
-            return (target["health"], target["job"])
+    async def _invoke(name: str) -> dict:
+        if name == "entities_per_day":
+            return await _guarded(
+                name,
+                _entities_per_day(
+                    db, org_uuid, start, end, limit, project_id, backend
+                ),
+            )
+        if name == "top_projects_by_episodes":
+            return await _guarded(
+                name,
+                _top_projects_by_episodes(
+                    db,
+                    org_uuid,
+                    start,
+                    end,
+                    limit,
+                    project_id,
+                    include_archived,
+                ),
+            )
+        handler = _QUERY_HANDLERS[name]
+        return await _guarded(
+            name, handler(db, org_uuid, start, end, limit, project_id)
+        )
 
-        targets.sort(key=_target_key, reverse=(sort_dir == "desc"))
+    names = list(_QUERY_HANDLERS)
+    try:
+        # Concurrent ceiling is ~8s (slowest Prom query), so the 15s overall
+        # budget below rarely fires — it bounds pathological scheduling, not
+        # the common case.
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*(_invoke(n) for n in names), return_exceptions=True),
+            timeout=15.0,
+        )
+    except TimeoutError as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        return {
+            "results": {},
+            "errors": [_classify_batch_error(n, exc) for n in names],
+            "meta": {
+                **window_meta,
+                "limit": limit,
+                "duration_ms": duration_ms,
+                "partial": True,
+            },
+        }
 
-    return {"status": "ok", "targets": targets}
+    results: dict[str, dict] = {}
+    errors: list[dict] = []
+    for name, outcome in zip(names, outcomes, strict=True):
+        if isinstance(outcome, BaseException):
+            # CancelledError is control flow, not a per-query failure.
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            errors.append(_classify_batch_error(name, outcome))
+        else:
+            results[name] = outcome
+
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    return {
+        "results": results,
+        "errors": errors,
+        "meta": {
+            **window_meta,
+            "limit": limit,
+            "duration_ms": duration_ms,
+            "partial": bool(errors),
+        },
+    }
 
 
 # ── DB helper functions ───────────────────────────────────────────────────────

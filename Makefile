@@ -31,7 +31,8 @@ VERSION ?= 0.0.0
 # with the bootstrap credentials loaded.
 dev:
 	@bash scripts/dev_preflight.sh
-	@set -a && source .env && set +a && uvicorn services.api.asgi:app --reload --port $(PORT)
+	# Bind 0.0.0.0 so the Prometheus container can scrape host.docker.internal:8000 (uvicorn defaults to 127.0.0.1).
+	@set -a && source .env && set +a && uvicorn services.api.asgi:app --reload --host 0.0.0.0 --port $(PORT)
 
 # ── Installation ──────────────────────────────────────────────────────────────
 
