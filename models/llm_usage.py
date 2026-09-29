@@ -1,32 +1,42 @@
-"""LLM usage model — append-only record of every LLM inference call.
+"""LLM usage model — append-only record of every metered inference call.
 
-This table tracks token consumption, cost estimates, and latency per inference
-call. It is **immutable** — rows are inserted once and never modified.
-The ``total_tokens`` column is a generated column computed as
-``prompt_tokens + completion_tokens``.
+This table tracks token consumption and latency per inference call for
+operational observability. It is **immutable** — rows are inserted once
+and never modified. The ``total_tokens`` column is a generated column
+computed as ``prompt_tokens + completion_tokens``.
 """
 
 import uuid
-from decimal import Decimal
 
-from sqlalchemy import Computed, Integer, Numeric, Text, func
+from sqlalchemy import Computed, Index, Integer, Text, func
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, CreatedAtMixin
 
 
 class LLMUsage(CreatedAtMixin, Base):
-    """A single LLM inference usage record.
+    """A single metered LLM inference usage record.
 
     Attributes:
         id: UUID primary key.
         organization_id: Owning organization (denormalized for fast
             aggregation queries).
+        provider: Backend identifier (e.g. ``openai``, ``ollama``).
         model: Model identifier (e.g., ``gpt-4o``, ``claude-sonnet-4``).
-        task_type: Type of task (e.g., ``chat.completion``,
-            ``embedding``, ``classification``).
+        task_type: Task vocabulary label (e.g., ``enrich_episode``).
+        worker: Worker/service that issued the call (e.g.
+            ``enrich_episode``, ``query_embed``, ``schema_preview``).
+        project_id: Project scope, when known.
+        episode_id: Source episode, when the call enriches one.
+        session_id: Source session, when known.
+        community_id: Community being summarised, when applicable.
+        task_run_id: Owning task run, when applicable.
         prompt_tokens: Number of tokens in the prompt.
         completion_tokens: Number of tokens in the completion.
+        reasoning_tokens: Reasoning tokens reported separately by the
+            provider (folded into ``completion_tokens`` upstream, so
+            excluded from ``total_tokens``).
         cache_read_input_tokens: Tokens served from the provider's prompt
             cache (e.g. Anthropic ``cache_read_input_tokens``).
         cache_creation_input_tokens: Tokens written to the provider's prompt
@@ -34,7 +44,10 @@ class LLMUsage(CreatedAtMixin, Base):
         total_tokens: **Generated column** — always equals
             ``prompt_tokens + completion_tokens``. Computed and stored
             by PostgreSQL; cannot be written directly.
-        cost_estimate: Estimated cost in USD (12 digits, 8 decimal places).
+        embed_count: Number of embedded texts (embed calls only).
+        embed_dim: Embedding dimensionality (embed calls only).
+        idempotency_key: Deduplication key — inserts conflict-do-nothing
+            on this column.
         duration_ms: Wall-clock duration of the inference call in
             milliseconds.
         created_at: Immutable timestamp (inherited from ``CreatedAtMixin``).
@@ -48,8 +61,27 @@ class LLMUsage(CreatedAtMixin, Base):
         server_default=func.gen_random_uuid(),
     )
     organization_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    provider: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
+    )
     model: Mapped[str] = mapped_column(Text, nullable=False)
     task_type: Mapped[str] = mapped_column(Text, nullable=False)
+    worker: Mapped[str | None] = mapped_column(Text, nullable=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    episode_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    community_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    task_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
     prompt_tokens: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -57,6 +89,12 @@ class LLMUsage(CreatedAtMixin, Base):
         server_default="0",
     )
     completion_tokens: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    reasoning_tokens: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
@@ -83,17 +121,18 @@ class LLMUsage(CreatedAtMixin, Base):
         Computed("prompt_tokens + completion_tokens", persisted=True),
         nullable=False,
     )
-    cost_estimate: Mapped[Decimal] = mapped_column(
-        Numeric(12, 8),
-        nullable=False,
-        default=0,
-        server_default="0",
-    )
+    embed_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    embed_dim: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     duration_ms: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
         server_default="0",
+    )
+
+    __table_args__ = (
+        Index("ix_llm_usage_org_created", "organization_id", "created_at"),
     )
 
     def __repr__(self) -> str:

@@ -62,14 +62,14 @@ class _FakeEmbedResponse:
 
 
 class _FakeEmbedBackend:
-    async def embed(self, texts, model=None) -> _FakeEmbedResponse:
+    async def embed(self, texts, model=None, metered=True) -> _FakeEmbedResponse:
         return _FakeEmbedResponse(
             embeddings=[[0.0] * 768 for _ in texts]
         )
 
 
 async def _fake_resolve_backend(
-    provider=None, org_config=None, mode=None
+    provider=None, org_config=None, mode=None, sink=None
 ) -> _FakeEmbedBackend:
     return _FakeEmbedBackend()
 

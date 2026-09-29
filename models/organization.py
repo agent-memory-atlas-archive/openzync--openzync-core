@@ -1,6 +1,6 @@
 """Organization model — top-level tenant entity.
 
-Each organization owns users, API keys, extraction schemas, and billing config.
+Each organization owns users, API keys, extraction schemas, and org settings.
 Isolation between organizations is enforced via RLS policies keyed on
 ``organization_id`` throughout the schema.
 """
@@ -21,7 +21,7 @@ class Organization(TimestampMixin, Base):
         id: UUID primary key, generated server-side via gen_random_uuid().
         name: Human-readable organization name.  The platform org is always
             named ``SYSTEM`` (exact match — see :attr:`is_platform`).
-        plan: Billing plan — one of ``free``, ``pro``, ``enterprise``.
+        plan: Subscription tier — one of ``free``, ``pro``, ``enterprise``.
         status: Lifecycle state — one of ``pending``, ``approved``,
             ``rejected``.  ``pending`` orgs await superadmin approval and
             are excluded from every tenant-facing lookup.

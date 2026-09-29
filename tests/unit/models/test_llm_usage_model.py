@@ -9,7 +9,7 @@ from models.llm_usage import LLMUsage
 
 
 class TestLLMUsageModel:
-    """Cover LLMUsage fields — model, task_type, tokens, cost, duration."""
+    """Cover LLMUsage fields — model, task_type, tokens, duration."""
 
     @pytest.mark.unit
     def test_required_fields(self) -> None:
@@ -25,17 +25,23 @@ class TestLLMUsageModel:
 
     @pytest.mark.unit
     def test_defaults_configured(self) -> None:
-        """Token/cost/duration columns have server_defaults."""
+        """Token/duration columns have server_defaults."""
         for col_name in [
             "prompt_tokens",
             "completion_tokens",
+            "reasoning_tokens",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
-            "cost_estimate",
             "duration_ms",
         ]:
             col = LLMUsage.__table__.columns[col_name]
             assert col.server_default is not None, f"{col_name} missing server_default"
+
+    @pytest.mark.unit
+    def test_idempotency_key_non_nullable(self) -> None:
+        """idempotency_key is required (non-nullable)."""
+        col = LLMUsage.__table__.columns["idempotency_key"]
+        assert col.nullable is False
 
     @pytest.mark.unit
     def test_total_tokens_column(self) -> None:

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import audit_action
@@ -121,6 +121,7 @@ async def list_schemas(
 )
 async def preview_schema_extraction(
     payload: PreviewExtractionRequest,
+    request: Request,
     service: SchemaService = Depends(_get_schema_service),
     org_config: OrgConfigBase = Depends(get_org_config_dep),
     org_id: str = Depends(require_permission("configuration:read")),
@@ -137,6 +138,8 @@ async def preview_schema_extraction(
         sample_text=payload.sample_text,
         prompt_template=payload.prompt_template,
         llm_config=org_config.to_llm_config_dict(),
+        org_id=UUID(org_id),
+        session_factory=request.app.state.db_session_factory,
     )
 
 

@@ -11,6 +11,8 @@ Orgs define extraction schemas for two purposes:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
@@ -28,6 +30,9 @@ from schemas.extraction_schemas import (
     SchemaTemplateResponse,
     UpdateExtractionSchemaRequest,
 )
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +209,8 @@ class SchemaService:
         sample_text: str,
         prompt_template: str | None = None,
         llm_config: dict | None = None,
+        org_id: UUID | None = None,
+        session_factory: Callable[[], AsyncSession] | None = None,
     ) -> PreviewExtractionResponse:
         """Run a no-persist extraction preview against a candidate schema.
 
@@ -219,6 +226,10 @@ class SchemaService:
             llm_config: Org LLM config dict (from
                 ``OrgConfigBase.to_llm_config_dict()``); required to
                 resolve the backend.
+            org_id: Authenticated org — enables metering when
+                ``session_factory`` is also given.
+            session_factory: Isolated-session factory for the metering
+                sink (the preview itself writes nothing).
 
         Returns:
             The extracted object plus field-level validation errors
@@ -233,6 +244,7 @@ class SchemaService:
         # Lazy imports — keeps the service import graph light and mirrors
         # the worker/API convention for optional/heavy dependencies.
         from core.llm import resolve_backend  # noqa: PLC0415
+        from services.usage_service import make_sink  # noqa: PLC0415
         from workers.tasks.extract_structured import (  # noqa: PLC0415
             PREVIEW_SCHEMA_NAME,
             build_extraction_prompt,
@@ -251,7 +263,12 @@ class SchemaService:
             len(sample_text),
         )
 
-        backend = await resolve_backend(org_config=llm_config)
+        sink = (
+            make_sink(session_factory, org_id=org_id, worker="schema_preview")
+            if org_id is not None and session_factory is not None
+            else None
+        )
+        backend = await resolve_backend(org_config=llm_config, sink=sink)
         response = await backend.chat(
             [
                 {
@@ -265,6 +282,7 @@ class SchemaService:
             ],
             temperature=0.0,
             max_tokens=PREVIEW_MAX_TOKENS,
+            metered=True,
         )
 
         parsed = parse_extraction_json(response.content)

@@ -223,7 +223,11 @@ class OrgConfigConnectionService:
             chat_kwargs: dict[str, Any] = {"max_tokens": 1}
             if merged.llm_model is not None:
                 chat_kwargs["model"] = merged.llm_model
-            await backend.chat([{"role": "user", "content": "ping"}], **chat_kwargs)
+            await backend.chat(
+                [{"role": "user", "content": "ping"}],
+                metered=False,
+                **chat_kwargs,
+            )
             return self._success(start, f"llm ok via {backend.model_name}")
         except asyncio.CancelledError:
             raise
@@ -254,7 +258,7 @@ class OrgConfigConnectionService:
                 mode="embedding",
             )
             model = resolve_embed_model(merged.embedding_backend)
-            response = await backend.embed(["ping"], model=model)
+            response = await backend.embed(["ping"], model=model, metered=False)
             vectors = response.embeddings
             if not vectors or not vectors[0]:
                 return self._failure(start, "embeddings probe failed: empty response")

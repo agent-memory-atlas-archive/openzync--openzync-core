@@ -117,6 +117,7 @@ async def embed_fact(
         validate_embedding_dim,
     )
     from core.llm import resolve_backend
+    from services.usage_service import make_sink
 
     logger.info("embed_fact.started", fact_id=fact_id, trace_id=trace_id)
 
@@ -207,15 +208,21 @@ async def embed_fact(
     _org_config_dict = org_cfg.to_llm_config_dict()
 
     # ── 1. Resolve the embedding backend ──────────────────────────────────
+    sink = (
+        make_sink(session_factory, org_id=uuid.UUID(str(_org_id)), worker="embed_fact")
+        if _org_id
+        else None
+    )
     llm = await resolve_backend(
         provider=_embedding_backend,
         org_config=_org_config_dict,
         mode="embedding",
+        sink=sink,
     )
 
     # ── 2. Generate embedding ────────────────────────────────────────────
     try:
-        result = await llm.embed([content], model=_embedding_model)
+        result = await llm.embed([content], model=_embedding_model, metered=True)
         embedding = result.embeddings[0]
     except Exception as e:
         if not _is_retryable(e):

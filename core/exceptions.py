@@ -136,20 +136,6 @@ class RateLimitError(AppError):
         super().__init__(message=message, detail=detail)
 
 
-class InsufficientCreditsError(AppError):
-    """Account balance too low to perform the requested operation."""
-
-    status_code: int = 402
-    code: str = "insufficient_credits"
-
-    def __init__(
-        self,
-        message: str = "Insufficient credits to complete this request.",
-        detail: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message=message, detail=detail)
-
-
 class ExternalServiceError(AppError):
     """External dependency (LLM, DB, S3, etc.) returned an error or timed out."""
 
@@ -536,7 +522,6 @@ def register_exception_handlers(app: FastAPI) -> None:
         AuthorizationError: 403,
         ConflictError: 409,
         RateLimitError: 429,
-        InsufficientCreditsError: 402,
         ExternalServiceError: 502,
         PIIUnavailableError: 503,
         LLMConfigurationError: 502,

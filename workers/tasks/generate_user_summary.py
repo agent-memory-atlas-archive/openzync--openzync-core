@@ -19,7 +19,6 @@ Pipeline:
 
 from __future__ import annotations
 
-import time
 import uuid
 
 import structlog
@@ -101,7 +100,7 @@ async def generate_user_summary(
     # path below, mirroring enrich_episode's section-2 skip.
     from core.exceptions import GraphBackendUnavailableError
     from core.llm import build_cache_config, resolve_backend
-    from services.usage_service import record_llm_usage
+    from services.usage_service import make_sink
     from workers.backend import resolve_graph_backend
 
     graph_backend = None
@@ -180,8 +179,13 @@ async def generate_user_summary(
         )
 
     try:
-        llm = await resolve_backend(org_config=llm_config_dict)
-        start = time.monotonic()
+        sink = make_sink(
+            session_factory,
+            org_id=uuid.UUID(org_id),
+            worker="user_summary",
+            project_id=uuid.UUID(project_id) if project_id else None,
+        )
+        llm = await resolve_backend(org_config=llm_config_dict, sink=sink)
         response = await llm.chat(
             [
                 {
@@ -194,6 +198,7 @@ async def generate_user_summary(
             ],
             temperature=0.3,
             cache_config=build_cache_config(org_config=llm_config_dict),
+            metered=True,
         )
     except Exception as exc:
         logger.error(
@@ -212,17 +217,6 @@ async def generate_user_summary(
             await UserRepository(db).update_summary(
                 user_id=uuid.UUID(user_id),
                 summary=response.content,
-            )
-            # Usage row shares the summary-persist transaction — the chat
-            # itself is not transactional, so this is the earliest commit
-            # point that keeps the record atomic with the surrounding work.
-            await record_llm_usage(
-                session=db,
-                organization_id=uuid.UUID(org_id),
-                model=response.model,
-                task_type="user_summary",
-                usage=response.usage,
-                duration_ms=round((time.monotonic() - start) * 1000),
             )
             await db.commit()
     except Exception as exc:

@@ -43,6 +43,7 @@ from middleware.tracing import TracingMiddleware
 from routers import (
     admin,
     admin_invites,
+    admin_llm_usage,
     admin_metrics,
     admin_org_code,
     admin_org_config,
@@ -271,6 +272,7 @@ def create_app() -> FastAPI:
     # and /ready; the /v1 prefix made them 404 on deployed instances.
     app.include_router(health.router, tags=["Health"])
     app.include_router(admin.router)
+    app.include_router(admin_llm_usage.router)
     app.include_router(admin_metrics.router)
     app.include_router(admin_schemas.router)
     app.include_router(admin_stats.router)

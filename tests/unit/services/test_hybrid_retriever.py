@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
@@ -167,7 +167,7 @@ class TestHybridRetriever:
 
         # Exactly one embed call for the whole search — both vector legs
         # receive the same precomputed vector.
-        service._embed_query.assert_awaited_once_with("test query")
+        service._embed_query.assert_awaited_once_with("test query", self.PROJECT_ID)
         embedding = service._embed_query.return_value
         service._vector_search_episodes.assert_awaited_once_with(
             embedding, self.PROJECT_ID, 20,
@@ -688,10 +688,12 @@ class TestEmbedQuery:
             provider="openai",
             org_config={"provider": "openai"},
             mode="embedding",
+            sink=ANY,
         )
         mock_backend.embed.assert_awaited_once_with(
             ["test"],
             model=CANONICAL_EMBED_MODEL,
+            metered=True,
         )
 
 

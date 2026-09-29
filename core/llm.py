@@ -15,11 +15,15 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
+from uuid import UUID
 
 import orjson
 from pydantic import BaseModel, ValidationError
@@ -50,6 +54,9 @@ class TokenUsage:
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # ⚠️ BREAKING: new field. Providers fold reasoning into completion, so
+    # total_tokens stays prompt + completion; reasoning is tracked separately.
+    reasoning_tokens: int = 0
     cache_read_input_tokens: int = 0  # tokens served from provider cache
     cache_creation_input_tokens: int = 0  # tokens written to provider cache
 
@@ -103,6 +110,52 @@ class EmbeddingResponse:
     embeddings: list[list[float]]
     model: str
     dim: int
+    # ⚠️ BREAKING: new field. Prompt tokens reported by the provider
+    # (zeros when the provider exposes no embedding usage, e.g. Ollama).
+    usage: TokenUsage = field(default_factory=TokenUsage)
+
+    @property
+    def count(self) -> int:
+        """Number of embedding vectors in this response."""
+        return len(self.embeddings)
+
+
+@dataclass(frozen=True)
+class UsageRecord:
+    """Tracking-only metering payload for a single LLM/embedding call.
+
+    Built by :meth:`LLMBackend.chat` / :meth:`LLMBackend.embed` from the
+    provider response and handed to the attached :class:`UsageSink`.
+    The sink fills ``org_id``/``worker``/entity ids from its baked scope
+    when the record leaves them empty — callers never set them directly.
+    """
+
+    org_id: UUID | None = None
+    provider: str = ""
+    model: str = ""
+    worker: str = ""
+    project_id: UUID | None = None
+    episode_id: UUID | None = None
+    session_id: UUID | None = None
+    community_id: UUID | None = None
+    task_run_id: UUID | None = None
+    duration_ms: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    embed_count: int | None = None
+    embed_dim: int | None = None
+    idempotency_key: str = ""
+
+
+class UsageSink(Protocol):
+    """Persist a metering record. Never raises — failures are logged."""
+
+    async def __call__(self, record: UsageRecord) -> None:
+        """Persist *record*. Never raises — failures are logged."""
+        ...
 
 
 def build_cache_config(
@@ -219,12 +272,17 @@ class LLMBackend(ABC):
     #: provided but the LLM output fails to parse into it.
     VALIDATION_RETRIES: int = 2
 
+    _usage_sink: UsageSink | None = None
+    """Default sink attached by :func:`resolve_backend` (per-call ``sink`` wins)."""
+
     async def chat(
         self,
         messages: list[dict],
         response_model: type[BaseModel] | None = None,
         validation_retries: int | None = None,
         cache_config: PromptCachingConfig | None = None,
+        sink: UsageSink | None = None,
+        metered: bool = False,
         **kwargs: Any,
     ) -> ChatResponse:
         """Send a chat completion, optionally validating against a Pydantic model.
@@ -259,6 +317,11 @@ class LLMBackend(ABC):
                 ``None`` (default), a config is built from global settings
                 via :func:`build_cache_config` — caching is on by default
                 unless the ``OZ_PROMPT_CACHING_ENABLED`` kill switch is off.
+            sink: Optional metering sink.  Defaults to the instance sink
+                attached by :func:`resolve_backend`.
+            metered: Only when ``True`` is a usage record emitted (final
+                attempt only — validation/provider retries never emit).
+                Connection pings pass ``False`` to stay out of metering.
             **kwargs: Additional provider-specific parameters (temperature,
                 max_tokens, top_p, etc.).
 
@@ -274,6 +337,7 @@ class LLMBackend(ABC):
             if validation_retries is not None
             else self.VALIDATION_RETRIES
         )
+        start = time.monotonic()
 
         # Default-on prompt caching: build once so every _chat() call —
         # including validation retries — reuses the same config.
@@ -282,7 +346,9 @@ class LLMBackend(ABC):
 
         # No schema — fast path, delegate directly.
         if response_model is None:
-            return await self._chat(messages, cache_config=cache_config, **kwargs)
+            response = await self._chat(messages, cache_config=cache_config, **kwargs)
+            await self._maybe_emit_usage(sink, metered, response, start)
+            return response
 
         messages = self._inject_schema_instr(messages, response_model)
 
@@ -296,6 +362,7 @@ class LLMBackend(ABC):
                 response.validated_data = response_model.model_validate_json(
                     response.content
                 )
+                await self._maybe_emit_usage(sink, metered, response, start)
                 return response
             except ValidationError:
                 pass
@@ -308,6 +375,7 @@ class LLMBackend(ABC):
                     # Normalise content to clean JSON so callers can use
                     # ``model_validate_json()`` without pre-processing.
                     response.content = orjson.dumps(extracted).decode()
+                    await self._maybe_emit_usage(sink, metered, response, start)
                     return response
                 except ValidationError:
                     pass  # fall through to retry
@@ -331,6 +399,51 @@ class LLMBackend(ABC):
             )
 
         raise RuntimeError("unreachable")  # pragma: no cover
+
+    async def _maybe_emit_usage(
+        self,
+        sink: UsageSink | None,
+        metered: bool,
+        response: ChatResponse | EmbeddingResponse,
+        start: float,
+        embed_count: int | None = None,
+        embed_dim: int | None = None,
+    ) -> None:
+        """Emit a metering record for a completed call. Never raises.
+
+        Args:
+            sink: Per-call sink override (falls back to the instance sink).
+            metered: Only ``True`` emits — pings opt out with ``False``.
+            response: The provider response to meter.
+            start: ``time.monotonic()`` timestamp from before the call.
+            embed_count: Number of embedded texts (embed path only).
+            embed_dim: Embedding dimensionality (embed path only).
+        """
+        effective = sink if sink is not None else self._usage_sink
+        if not metered or effective is None:
+            return
+        record = UsageRecord(
+            provider=self.provider_name,
+            model=response.model,
+            duration_ms=round((time.monotonic() - start) * 1000),
+            prompt_tokens=response.usage.prompt_tokens,
+            completion_tokens=response.usage.completion_tokens,
+            reasoning_tokens=response.usage.reasoning_tokens,
+            cache_read_input_tokens=response.usage.cache_read_input_tokens,
+            cache_creation_input_tokens=response.usage.cache_creation_input_tokens,
+            embed_count=embed_count,
+            embed_dim=embed_dim,
+            idempotency_key=uuid.uuid4().hex,
+        )
+        try:
+            await effective(record)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "llm.usage_sink_failed",
+                extra={"provider": record.provider, "model": record.model},
+            )
 
     @abstractmethod
     async def _chat(
@@ -460,17 +573,52 @@ class LLMBackend(ABC):
 
     # ── Abstract members ───────────────────────────────────────────────────────
 
-    @abstractmethod
-    async def embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
+    # ⚠️ BREAKING: backends now implement ``_embed``; the public ``embed``
+    # below adds metering (sink + timing) around it.
+    async def embed(
+        self,
+        texts: list[str],
+        sink: UsageSink | None = None,
+        metered: bool = False,
+        **kwargs: Any,
+    ) -> EmbeddingResponse:
         """Generate embeddings for one or more text strings.
 
         Args:
             texts: List of input strings to embed.
+            sink: Optional metering sink (falls back to the instance sink).
+            metered: Only when ``True`` is a usage record emitted.
+                Connection pings pass ``False`` to stay out of metering.
             **kwargs: Additional provider-specific parameters.
 
         Returns:
             An ``EmbeddingResponse`` containing the embedding vectors.
         """
+        start = time.monotonic()
+        response = await self._embed(texts, **kwargs)
+        await self._maybe_emit_usage(
+            sink,
+            metered,
+            response,
+            start,
+            embed_count=len(texts),
+            embed_dim=response.dim,
+        )
+        return response
+
+    @abstractmethod
+    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
+        """Provider-specific embedding implementation.
+
+        Override this in each backend.  The public :meth:`embed` wraps
+        this with metering logic.
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def provider_name(self) -> str:
+        """Provider identifier matching the registry key (e.g. ``"openai"``)."""
         ...
 
     @property
@@ -581,6 +729,7 @@ async def resolve_backend(
     provider: str | None = None,
     org_config: dict | None = None,
     mode: BackendMode | None = None,
+    sink: UsageSink | None = None,
 ) -> LLMBackend:
     """Resolve the appropriate LLM backend via org config or explicit argument.
 
@@ -605,6 +754,9 @@ async def resolve_backend(
             strict — no fallback to the LLM keys).  ``"llm"`` or ``None``
             keeps the chat behaviour (``openai_like_base_url`` +
             ``openai_api_key`` + ``llm_model``).
+        sink: Optional metering sink attached to the returned instance.
+            Build it with :func:`services.usage_service.make_sink`.  Calls
+            only emit when invoked with ``metered=True``.
 
     Returns:
         An initialised ``LLMBackend`` instance.
@@ -624,7 +776,9 @@ async def resolve_backend(
                 "llm.resolved_from_org_config",
                 extra={"provider": embedding_provider},
             )
-            return await _create_backend(embedding_provider, org_config, mode=mode)
+            return await _create_backend(
+                embedding_provider, org_config, mode=mode, sink=sink
+            )
         raise LLMConfigurationError(
             "No embedding backend configured.  Set "
             "embedding_backend in the per-org configuration."
@@ -637,13 +791,13 @@ async def resolve_backend(
             "llm.resolved_from_org_config",
             extra={"provider": provider_name},
         )
-        return await _create_backend(provider_name, org_config, mode=mode)
+        return await _create_backend(provider_name, org_config, mode=mode, sink=sink)
 
     # 2. Explicit argument.
     if provider is not None:
         provider_name = provider
         logger.debug("llm.resolved_from_argument", extra={"provider": provider_name})
-        return await _create_backend(provider_name, org_config, mode=mode)
+        return await _create_backend(provider_name, org_config, mode=mode, sink=sink)
 
     # 3. Nothing worked.
     raise LLMConfigurationError(
@@ -659,6 +813,7 @@ async def _create_backend(
     provider: str,
     config: dict | None = None,
     mode: BackendMode | None = None,
+    sink: UsageSink | None = None,
 ) -> LLMBackend:
     """Instantiate an LLM backend for *provider*, passing optional config.
 
@@ -677,6 +832,7 @@ async def _create_backend(
             and reads ``embedding_api_key`` (``None`` allowed → the backend
             uses its ``"not-needed"`` placeholder).  All other
             provider/mode combinations behave as before.
+        sink: Optional metering sink attached to the created instance.
 
     Returns:
         An initialised ``LLMBackend`` instance.
@@ -776,4 +932,5 @@ async def _create_backend(
             "openai_like, azure, anthropic."
         )
 
+    instance._usage_sink = sink
     return instance

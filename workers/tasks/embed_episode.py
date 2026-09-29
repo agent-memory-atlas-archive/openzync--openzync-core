@@ -72,6 +72,7 @@ async def embed_episode(
     from core.org_config import get_org_config
     from repositories.episode_repository import EpisodeRepository
     from repositories.project_repository import ProjectRepository
+    from services.usage_service import make_sink
 
     logger.info(
         "embed_episode.started",
@@ -186,15 +187,23 @@ async def embed_episode(
     _org_config_dict = org_cfg.to_llm_config_dict()
 
     # ── 3. Resolve the embedding backend ──────────────────────────────────
+    sink = make_sink(
+        session_factory,
+        org_id=uuid.UUID(org_id),
+        worker="embed_episode",
+        project_id=uuid.UUID(project_id),
+        episode_id=uuid.UUID(episode_id),
+    )
     llm = await resolve_backend(
         provider=_embedding_backend,
         org_config=_org_config_dict,
         mode="embedding",
+        sink=sink,
     )
 
     # ── 4. Generate embedding ────────────────────────────────────────────
     try:
-        result = await llm.embed([content], model=_embedding_model)
+        result = await llm.embed([content], model=_embedding_model, metered=True)
         embedding = result.embeddings[0]
     except Exception as e:
         logger.error(

@@ -127,7 +127,7 @@ SCHEMA_TEMPLATES: tuple[SchemaTemplateResponse, ...] = (
         key="invoice",
         name="Invoice",
         description=(
-            "Extracts billing details from invoices and bills: invoice "
+            "Extracts invoice details from invoices and bills: invoice "
             "number, vendor, dates, line items, and totals. Use when "
             "ingesting accounts-payable documents or payment threads."
         ),
