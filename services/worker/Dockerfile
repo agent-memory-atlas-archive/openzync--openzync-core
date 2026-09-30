@@ -30,11 +30,14 @@ WORKDIR /app
 # (build context excludes .git, so hatch-vcs would otherwise fall back).
 ARG APP_VERSION=""
 
-# Install build dependencies and the package itself.
+# Install the package with its [llm] extras, constrained to the CI-tested
+# versions that broke production when a rebuild floated past them
+# (constraints.txt pins only SQLAlchemy/asyncpg/pgvector; `-c` lets
+# everything else resolve as before, so the installed set is unchanged).
 # NOTE: README.md must be copied too — hatchling validates it exists at build time.
-COPY pyproject.toml README.md .
+COPY constraints.txt pyproject.toml README.md .
 RUN if [ -n "$APP_VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$APP_VERSION"; fi \
-    && pip install --no-cache-dir --user -e ".[llm]" \
+    && pip install --no-cache-dir --user -c constraints.txt -e ".[llm]" \
     && pip install --no-cache-dir --user https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
 # ──────────────────────────────────────────────────────────────────────────────

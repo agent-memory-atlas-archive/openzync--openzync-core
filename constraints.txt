@@ -1,0 +1,7 @@
+# Build constraints for Docker images (services/*/Dockerfile pass `-c constraints.txt`).
+# Sep-30 rc3 outage: an unpinned rebuild floated SQLAlchemy 2.0.50 -> 2.1.x, which
+# removed the `await_` hook core/db.py relied on and crash-looped the API. These
+# pins force the CI-tested trio; full image reproducibility is a separate follow-up.
+asyncpg==0.31.0
+pgvector==0.4.2
+SQLAlchemy==2.0.50
