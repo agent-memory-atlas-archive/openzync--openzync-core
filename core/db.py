@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.util.concurrency import await_only
 
 # Re-export the RLS-aware dependency so `from core.db import get_db` resolves
 # to the same function as `from dependencies.db import get_db`. The canonical
@@ -102,10 +103,22 @@ def _register_pgvector_codec(engine: AsyncEngine) -> None:
     only asserts the dimension) — never ``str`` literals, which the
     codec cannot decode.
 
-    Recipe verified against pgvector==0.4.2 (``async def
-    register_vector(conn, schema='public')``) and SQLAlchemy==2.0.50
-    (``AsyncAdapt_asyncpg_connection`` exposes ``await_`` and the raw
-    asyncpg connection as ``_connection``).
+    The coroutine is driven with
+    :func:`sqlalchemy.util.concurrency.await_only`, the documented bridge
+    for awaiting async work inside the sync ``"connect"`` event — the same
+    helper the asyncpg dialect itself uses for its JSON/JSONB codecs in
+    ``on_connect``. It is imported from the module rather than reached via
+    the adapted connection's ``await_`` method, which SQLAlchemy removed in
+    2.1.x (asyncio-connector rework) and which crashed every pooled
+    connection with ``AttributeError`` when the image floated past 2.0.x.
+
+    Recipe verified against SQLAlchemy==2.0.50 (installed: the dialect's
+    own ``await_`` is literally ``staticmethod(await_only)``, so this call
+    is identical to the previous one) and pgvector's async
+    ``register_vector(conn)`` coroutine (installed pgvector 0.5.0; the
+    pinned 0.4.2 in requirements.txt shares the signature). 2.1.x
+    compatibility follows from ``await_only`` being the documented public
+    bridge, but was not executed locally — the deployed boot is the proof.
 
     Args:
         engine: A genuine :class:`AsyncEngine`. Doubles that patch
@@ -119,7 +132,7 @@ def _register_pgvector_codec(engine: AsyncEngine) -> None:
 
     @event.listens_for(engine.sync_engine, "connect")
     def _on_connect(dbapi_conn, _connection_record) -> None:
-        dbapi_conn.await_(register_vector(dbapi_conn._connection))
+        await_only(register_vector(dbapi_conn._connection))
 
 
 async def close_db_engine(engine: AsyncEngine) -> None:
