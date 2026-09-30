@@ -1,1 +1,0 @@
-Changed the periodic enrichment reconciliation scan to match only episodes missing assessed LLM work and to skip soft-deleted rows, so it re-enqueues genuinely stale episodes instead of churning on rows that can never complete.
