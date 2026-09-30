@@ -5,3 +5,7 @@
 asyncpg==0.31.0
 pgvector==0.4.2
 SQLAlchemy==2.0.50
+# NumPy >=2.3 ships x86-64-v2-baseline wheels that fail to import on the
+# production CPU (via models -> pgvector -> numpy, hit in migrate and boot);
+# 2.2.6 is the latest pre-baseline 2.2.x (full-tree resolver check separate).
+numpy==2.2.6
