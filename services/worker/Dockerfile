@@ -40,6 +40,15 @@ RUN if [ -n "$APP_VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$APP_V
     && pip install --no-cache-dir --user -c constraints.txt -e ".[llm]" \
     && pip install --no-cache-dir --user https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
+# Bake the frozen embedder weights (nomic-ai/nomic-embed-text-v1.5) into the
+# image so no HuggingFace download happens on first request at runtime.
+# NOTE: no EMBED_MODEL_REV build-arg — fastembed 0.8.1 exposes no revision
+# parameter on TextEmbedding; the HF revision is pinned by fastembed's own
+# model registry, so the effective pin is fastembed==0.8.1 (constraints.txt)
+# + these baked weights. The image tag is the model pin.
+ENV FASTEMBED_CACHE_PATH=/opt/embed-cache
+RUN HF_HUB_OFFLINE=0 python -c "from fastembed import TextEmbedding; list(TextEmbedding('nomic-ai/nomic-embed-text-v1.5', cache_dir='/opt/embed-cache').embed(['bake']))"
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 FROM python:3.12-slim AS runtime
@@ -52,6 +61,9 @@ ENV OPENZYNC_VERSION=$APP_VERSION
 # Copy installed packages from builder.
 COPY --from=builder /root/.local /root/.local
 
+# Copy baked embedder weights from builder (see bake layer above).
+COPY --from=builder /opt/embed-cache /opt/embed-cache
+
 # Copy application source.
 COPY . .
 
@@ -63,7 +75,8 @@ RUN chmod +x /entrypoint_worker.sh
 # Ensure ~/.local/bin (where pip --user installs scripts) is on PATH.
 ENV PATH=/root/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    FASTEMBED_CACHE_PATH=/opt/embed-cache
 
 # Worker exposes an aiohttp /health endpoint on settings.HEALTH_PORT (default 8080)
 # managed by the ARQ worker loop. The 30s start-period covers the OpenBao Agent

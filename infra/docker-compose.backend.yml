@@ -435,7 +435,7 @@ services:
       - "host.docker.internal:host-gateway"
     deploy:
       resources:
-        limits: { cpus: "0.5", memory: "1G" }
+        limits: { cpus: "1", memory: "2G" }
     logging: *default-logging
     restart: unless-stopped
 

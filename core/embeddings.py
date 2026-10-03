@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from core.exceptions import ExternalServiceError
@@ -61,6 +62,15 @@ CANONICAL_EMBED_MODEL: str = "nomic-ai/nomic-embed-text-v1.5"
 
 CANONICAL_EMBED_DIM: int = 768
 """The single embedding dimension. Matches ``VECTOR(768)`` DDL."""
+
+MODEL_REVISION: str | None = None
+"""Pinned revision of :data:`CANONICAL_EMBED_MODEL`, if one is published.
+
+fastembed's registry metadata for ``nomic-ai/nomic-embed-text-v1.5`` publishes
+no revision digest (only the model id, file path, and dim), so there is
+nothing stable to pin here — this stays ``None`` and the Docker bake step
+pins the weights via build-arg instead. Do NOT invent a hash.
+"""
 
 PASSAGE_PREFIX: str = "search_document: "
 """Mandatory task prefix for the corpus side. Applied by :func:`embed_passage`."""
@@ -185,6 +195,33 @@ def validate_embedding_dim(vec: list[float], *, source: str) -> None:
         )
 
 
+def is_model_loaded() -> bool:
+    """Report whether the ONNX model has finished loading in this process.
+
+    Used by readiness probes so ``/ready`` stays 503 until the boot-time
+    :func:`prewarm_embeddings` completes, while ``/health`` stays
+    liveness-only.
+
+    Returns:
+        True once :func:`_ensure_model` has cached the model, else False.
+    """
+    return _MODEL is not None
+
+
+async def prewarm_embeddings() -> None:
+    """Load the model and run one dummy inference.
+
+    Called once at boot (API lifespan, worker startup) so a corrupt or
+    missing model bake fails fast instead of surfacing as user-facing 503s.
+    Callers must NOT catch — any error aborts startup loudly by design.
+
+    Raises:
+        Exception: Whatever model load or inference raises, unmodified.
+    """
+    await _ensure_model()
+    await embed_query(["ready"])
+
+
 # ── Internal helpers ────────────────────────────────────────────────────────
 
 
@@ -259,12 +296,19 @@ async def _run_off_loop(
         Exception: Whatever *fn* raised, after a structured error log.
     """
     loop = asyncio.get_running_loop()
+    started = time.perf_counter()
     try:
         return await loop.run_in_executor(None, fn)
     except Exception as exc:
+        duration_ms = round((time.perf_counter() - started) * 1000, 1)
         logger.error(
             "embeddings.inference_failed",
-            extra={"source": source, "model": CANONICAL_EMBED_MODEL, "error": str(exc)},
+            extra={
+                "source": source,
+                "model": CANONICAL_EMBED_MODEL,
+                "error": str(exc),
+                "duration_ms": duration_ms,
+            },
             exc_info=True,
         )
         raise
@@ -283,6 +327,7 @@ async def _ensure_model() -> Any:
         ImportError: If ``fastembed`` is not installed.
     """
     global _MODEL
+    requested = time.perf_counter()
     if _MODEL is not None:
         return _MODEL
 
@@ -301,17 +346,30 @@ async def _ensure_model() -> Any:
             ) from err
 
         # Constructing the model hits the HF cache / disk — off the loop.
+        # duration_ms here is lock-wait time (load hasn't started yet); the
+        # load itself is timed on model_loaded below.
         logger.info(
             "embeddings.loading_model",
-            extra={"model": CANONICAL_EMBED_MODEL, "dim": CANONICAL_EMBED_DIM},
+            extra={
+                "model": CANONICAL_EMBED_MODEL,
+                "dim": CANONICAL_EMBED_DIM,
+                "duration_ms": round((time.perf_counter() - requested) * 1000, 1),
+            },
         )
         loop = asyncio.get_running_loop()
+        load_started = time.perf_counter()
         model: Any = await loop.run_in_executor(
             None,
             lambda: TextEmbedding(CANONICAL_EMBED_MODEL, lazy_load=True),
         )
         _MODEL = model
-        logger.info("embeddings.model_loaded", extra={"model": CANONICAL_EMBED_MODEL})
+        logger.info(
+            "embeddings.model_loaded",
+            extra={
+                "model": CANONICAL_EMBED_MODEL,
+                "duration_ms": round((time.perf_counter() - load_started) * 1000, 1),
+            },
+        )
         return _MODEL
 
 
