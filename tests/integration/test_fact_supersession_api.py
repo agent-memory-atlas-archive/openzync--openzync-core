@@ -63,7 +63,6 @@ async def _fake_resolve_backend(
     return _FakeEmbedBackend()
 
 
-@pytest.fixture(autouse=True)
 async def _fake_embed(texts: list[str]) -> list[list[float]]:
     """Return one 768-dim zero vector per text.
 
@@ -73,6 +72,7 @@ async def _fake_embed(texts: list[str]) -> list[list[float]]:
     return [[0.0] * 768 for _ in texts]
 
 
+@pytest.fixture(autouse=True)
 def _fake_embedding_backend(monkeypatch) -> None:
     """Stub the local embedder so no ONNX model is downloaded in tests."""
     monkeypatch.setattr("core.embeddings.embed_query", _fake_embed)
