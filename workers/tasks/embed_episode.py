@@ -1,8 +1,9 @@
 """Embedding worker — generates pgvector embeddings for episode content.
 
 Runs after entity extraction (enrichment_status bit 0 must be set).
-Generates embeddings via the configured BYOK LLM backend and stores
-them in the ``episodes.embedding`` column.
+Generates embeddings with the single local embedder
+(``core.embeddings.embed_passage``) and stores them in the
+``episodes.embedding`` column.
 
 Queue: high-priority (real-time ingestion).
 """
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 import structlog
 
-from core.exceptions import EpisodeNotFoundError, SearchLegFailedError
+from core.exceptions import EpisodeNotFoundError
 from workers.tasks.base import ENRICHMENT_EMBEDDING, with_retry
 
 logger = structlog.get_logger()
@@ -29,13 +30,10 @@ async def embed_episode(
 ) -> None:
     """Generate an embedding for an episode and store it in pgvector.
 
-    The embedding backend comes from the per-org config
-    (``org_cfg.embedding_backend``); the model is the frozen canonical
-    model (``core.embeddings.resolve_embed_model``). There is no env-var
-    fallback — if no backend is configured the task raises
-    ``SearchLegFailedError`` so ARQ retries. Any vector that is not
-    exactly ``CANONICAL_EMBED_DIM`` raises ``ExternalServiceError`` and
-    is never stored.
+    Embeds with the single local embedder (``core.embeddings.embed_passage``)
+    — the document prefix, since this text is written to the corpus side of
+    the vector store.  Any vector that is not exactly ``CANONICAL_EMBED_DIM``
+    raises ``ExternalServiceError`` and is never stored.
 
     Args:
         ctx: ARQ worker context (unused — required by ARQ contract).
@@ -48,9 +46,7 @@ async def embed_episode(
 
     Raises:
         EpisodeNotFoundError: If no episode exists for ``episode_id``.
-        SearchLegFailedError: If org config fetch fails, org is not found,
-            or no embedding backend is configured.
-        ExternalServiceError: If the provider returns a non-canonical-dim
+        ExternalServiceError: If the embedder returns a non-canonical-dim
             vector.
     """
     if trace_id:
@@ -63,16 +59,9 @@ async def embed_episode(
 
     from core.config import settings
     from core.db import get_async_session
-    from core.embeddings import (
-        CANONICAL_EMBED_DIM,
-        resolve_embed_model,
-        validate_embedding_dim,
-    )
-    from core.llm import resolve_backend
-    from core.org_config import get_org_config
+    from core.embeddings import CANONICAL_EMBED_DIM, embed_passage
     from repositories.episode_repository import EpisodeRepository
     from repositories.project_repository import ProjectRepository
-    from services.usage_service import make_sink
 
     logger.info(
         "embed_episode.started",
@@ -135,76 +124,9 @@ async def embed_episode(
             )
             return
 
-    # ── 2b. Fetch per-organization config ──────────────────────────────────
-    org_cfg = None
+    # ── 3. Generate embedding ────────────────────────────────────────────
     try:
-        bao_client = ctx.get("openbao_client") if isinstance(ctx, dict) else None
-        if bao_client is not None:
-            org_cfg = await get_org_config(
-                uuid.UUID(org_id), redis=None, bao_client=bao_client
-            )
-        else:
-            from core.config import BootstrapSettings
-            from core.openbao import OpenBaoClient
-
-            bootstrap = BootstrapSettings()
-            async with OpenBaoClient(
-                bootstrap.OPENBAO_ADDR,
-                bootstrap.OPENBAO_ROLE_ID,
-                bootstrap.OPENBAO_SECRET_ID,
-                timeout=10.0,
-            ) as _tmp_bao:
-                org_cfg = await get_org_config(
-                    uuid.UUID(org_id), redis=None, bao_client=_tmp_bao
-                )
-    except Exception as exc:
-        logger.warning(
-            "embed_episode.org_config_fetch_failed",
-            org_id=org_id,
-            exc_info=True,
-        )
-        raise SearchLegFailedError(
-            leg_name="embedding",
-            message=f"Failed to fetch org config for org {org_id}: {exc}",
-            original_error=str(exc),
-        ) from exc
-
-    if org_cfg is None:
-        raise SearchLegFailedError(
-            leg_name="embedding",
-            message=f"Org config not found for org {org_id}",
-        )
-
-    if org_cfg.embedding_backend is None:
-        raise SearchLegFailedError(
-            leg_name="embedding",
-            message=f"No embedding backend configured for org {org_id}",
-            original_error=f"org_cfg.embedding_backend is None for org {org_id}",
-        )
-
-    _embedding_backend = org_cfg.embedding_backend
-    _embedding_model = resolve_embed_model(org_cfg.embedding_backend)
-    _org_config_dict = org_cfg.to_llm_config_dict()
-
-    # ── 3. Resolve the embedding backend ──────────────────────────────────
-    sink = make_sink(
-        session_factory,
-        org_id=uuid.UUID(org_id),
-        worker="embed_episode",
-        project_id=uuid.UUID(project_id),
-        episode_id=uuid.UUID(episode_id),
-    )
-    llm = await resolve_backend(
-        provider=_embedding_backend,
-        org_config=_org_config_dict,
-        mode="embedding",
-        sink=sink,
-    )
-
-    # ── 4. Generate embedding ────────────────────────────────────────────
-    try:
-        result = await llm.embed([content], model=_embedding_model, metered=True)
-        embedding = result.embeddings[0]
+        embedding = (await embed_passage([content]))[0]
     except Exception as e:
         logger.error(
             "embed_episode.embedding_failed",
@@ -213,15 +135,13 @@ async def embed_episode(
         )
         raise
 
-    # ── 5. Validate canonical dimension — fail loud, never store ─────────
-    validate_embedding_dim(embedding, source="embed_episode")
-
     # ── 4. Store in pgvector and update enrichment_status ─────────────────
     # The pgvector asyncpg codec IS registered via ``init_db_engine``, so
     # the vector goes in as native ``list[float]`` — the codec encodes it
     # and the static ``::vector(768)`` cast only asserts the dimension.
     # Passing a ``str`` literal here breaks decoding (asyncpg DataError).
-    # The dimension was validated above — the cast cannot silently reshape.
+    # ``embed_passage`` already validated the width — the cast cannot
+    # silently reshape.
 
     try:
         async with session_factory() as db:

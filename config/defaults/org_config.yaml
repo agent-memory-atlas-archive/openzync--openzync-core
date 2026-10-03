@@ -18,11 +18,10 @@ llm_model: gpt-4o-mini
 llm_temperature: 0.0
 llm_max_tokens: 4096
 
-embedding_backend: openai
-# NOTE: embedding model/dimension are frozen platform-wide
-# (snowflake-arctic-embed-m-v1.5, 768 dims — see core/embeddings.py).
-# embedding_model / embedding_dim must NOT be seeded here: PATCH/PUT
-# rejects them with 400 embedding_frozen.
+# Embeddings: no onboarding defaults. They are produced by a single local
+# ONNX model (core/embeddings.py) with nothing to configure — do NOT
+# reintroduce an embedding_* key here. This endpoint is unauthenticated,
+# so anything added is served to anonymous callers.
 
 graph_backend: falkordb
 graph_search_type: hybrid

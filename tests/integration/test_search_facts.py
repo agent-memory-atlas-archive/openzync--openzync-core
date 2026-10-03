@@ -57,35 +57,26 @@ async def _wire_graph_backend(isolated_app: Any) -> Any:
 
 
 @dataclass
-class _FakeEmbedResponse:
-    embeddings: list[list[float]] | None = None
+async def _fake_embed(texts: list[str]) -> list[list[float]]:
+    """Return one 768-dim zero vector per text.
 
-
-class _FakeEmbedBackend:
-    async def embed(self, texts, model=None, metered=True) -> _FakeEmbedResponse:
-        return _FakeEmbedResponse(
-            embeddings=[[0.0] * 768 for _ in texts]
-        )
-
-
-async def _fake_resolve_backend(
-    provider=None, org_config=None, mode=None, sink=None
-) -> _FakeEmbedBackend:
-    return _FakeEmbedBackend()
+    Matches the ``vector(768)`` columns so the pgvector ``<=>`` operator
+    works, and satisfies ``validate_embedding_dim``.
+    """
+    return [[0.0] * 768 for _ in texts]
 
 
 @pytest.fixture(autouse=True)
 def _fake_embedding_backend(monkeypatch) -> None:
-    """Stub the embedding backend for the vector search leg.
+    """Stub the local embedder for the vector search leg.
 
-    ``HybridRetriever._embed_query`` imports ``core.llm.resolve_backend``
-    at call time; in the test environment no embedding backend is
-    configured, so resolution raises and the whole search 503s.      The fake
-    returns a 768-dim zero vector per text — matching the
-    ``episodes.embedding`` ``vector(768)`` column so the pgvector ``<=>``
-    operator works.
+    ``HybridRetriever._embed_query`` imports ``core.embeddings.embed_query``
+    at call time; without a stub the ONNX model would be downloaded and
+    run for real.  Both the query and passage entrypoints are stubbed —
+    the latter is used by the ingest path.
     """
-    monkeypatch.setattr("core.llm.resolve_backend", _fake_resolve_backend)
+    monkeypatch.setattr("core.embeddings.embed_query", _fake_embed)
+    monkeypatch.setattr("core.embeddings.embed_passage", _fake_embed)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -118,7 +109,11 @@ class TestSearchFacts:
                 "session_id": isolated_search_session,
                 "facts": [
                     {"subject": "Alice", "predicate": "likes", "object": "hiking"},
-                    {"subject": "Bob", "predicate": "enjoys", "object": "mountain biking"},
+                    {
+                        "subject": "Bob",
+                        "predicate": "enjoys",
+                        "object": "mountain biking",
+                    },
                 ],
             },
         )
@@ -128,11 +123,15 @@ class TestSearchFacts:
             f"/v1/projects/{isolated_project_id}/search",
             params={"query": "hiking", "types": "facts"},
         )
-        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        assert resp.status_code == 200, (
+            f"Expected 200, got {resp.status_code}: {resp.text}"
+        )
         body = resp.json()
         assert "results" in body
         # Should find the hiking fact
-        hiking_results = [r for r in body["results"] if "hiking" in r.get("content", "")]
+        hiking_results = [
+            r for r in body["results"] if "hiking" in r.get("content", "")
+        ]
         assert len(hiking_results) >= 1, (
             f"Expected at least 1 fact about hiking, got {len(hiking_results)}. "
             f"Results: {body['results']}"
@@ -201,7 +200,10 @@ class TestSearchFacts:
                     {
                         "session_id": isolated_search_session,
                         "messages": [
-                            {"role": "user", "content": "I love mountain hiking in Colorado"},
+                            {
+                                "role": "user",
+                                "content": "I love mountain hiking in Colorado",
+                            },
                         ],
                     }
                 ),
@@ -228,6 +230,5 @@ class TestSearchFacts:
         body = resp.json()
         assert "results" in body
         assert len(body["results"]) >= 1, (
-            f"Expected at least 1 result, got {len(body['results'])}. "
-            f"Body: {body}"
+            f"Expected at least 1 result, got {len(body['results'])}. Body: {body}"
         )

@@ -3,11 +3,12 @@
 Tests the static ``_rrf_merge`` method directly (pure algorithm, no I/O) and
 ``hybrid_search`` with all retrieval legs mocked at the service boundary.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
@@ -170,10 +171,14 @@ class TestHybridRetriever:
         service._embed_query.assert_awaited_once_with("test query", self.PROJECT_ID)
         embedding = service._embed_query.return_value
         service._vector_search_episodes.assert_awaited_once_with(
-            embedding, self.PROJECT_ID, 20,
+            embedding,
+            self.PROJECT_ID,
+            20,
         )
         service._vector_search_facts.assert_awaited_once_with(
-            embedding, self.PROJECT_ID, 20,
+            embedding,
+            self.PROJECT_ID,
+            20,
         )
 
     @pytest.mark.asyncio
@@ -355,9 +360,7 @@ class TestHybridRetriever:
         service._bm25_search_facts = AsyncMock(
             return_value=[self._make_item("bf1", 0.75)]
         )
-        service._graph_bfs_search = AsyncMock(
-            return_value=[self._make_item("e1", 1.0)]
-        )
+        service._graph_bfs_search = AsyncMock(return_value=[self._make_item("e1", 1.0)])
 
         with pytest.raises(SearchLegFailedError) as exc_info:
             await service.hybrid_search("query", self.PROJECT_ID)
@@ -388,9 +391,7 @@ class TestHybridRetriever:
         service._bm25_search_facts = AsyncMock(
             return_value=[self._make_item("bf1", 0.75)]
         )
-        service._graph_bfs_search = AsyncMock(
-            return_value=[self._make_item("e1", 1.0)]
-        )
+        service._graph_bfs_search = AsyncMock(return_value=[self._make_item("e1", 1.0)])
 
         with pytest.raises(SearchLegFailedError) as exc_info:
             await service.hybrid_search("query", self.PROJECT_ID)
@@ -477,9 +478,6 @@ class TestHybridRetriever:
         mock_org_config = MagicMock()
         mock_org_config.reranker_top_k = 75
         mock_org_config.reranker_top_n = 10
-        mock_org_config.embedding_backend = None
-        mock_org_config.embedding_model = None
-        mock_org_config.embedding_dim = None
         mock_org_config.to_llm_config_dict.return_value = None
 
         mock_db = AsyncMock()
@@ -506,16 +504,24 @@ class TestHybridRetriever:
         # (the ``_embed_query`` stub's return value), not the query string.
         embedding = [0.1, 0.2, 0.3]
         service._vector_search_episodes.assert_awaited_once_with(
-            embedding, self.PROJECT_ID, expected_limit,
+            embedding,
+            self.PROJECT_ID,
+            expected_limit,
         )
         service._vector_search_facts.assert_awaited_once_with(
-            embedding, self.PROJECT_ID, expected_limit,
+            embedding,
+            self.PROJECT_ID,
+            expected_limit,
         )
         service._bm25_search_episodes.assert_awaited_once_with(
-            "query", self.PROJECT_ID, expected_limit,
+            "query",
+            self.PROJECT_ID,
+            expected_limit,
         )
         service._bm25_search_facts.assert_awaited_once_with(
-            "query", self.PROJECT_ID, expected_limit,
+            "query",
+            self.PROJECT_ID,
+            expected_limit,
         )
 
     @pytest.mark.asyncio
@@ -533,7 +539,9 @@ class TestHybridRetriever:
         )
         service._embed_query = AsyncMock(return_value=[0.1, 0.2, 0.3])
 
-        service._vector_search_episodes = AsyncMock(return_value=[self._make_item("a", 0.9)])
+        service._vector_search_episodes = AsyncMock(
+            return_value=[self._make_item("a", 0.9)]
+        )
         service._vector_search_facts = AsyncMock(return_value=[])
         service._bm25_search_episodes = AsyncMock(return_value=[])
         service._bm25_search_facts = AsyncMock(return_value=[])
@@ -559,7 +567,9 @@ class TestHybridRetriever:
         )
         service._embed_query = AsyncMock(return_value=[0.1, 0.2, 0.3])
 
-        service._vector_search_episodes = AsyncMock(return_value=[self._make_item("a", 0.9)])
+        service._vector_search_episodes = AsyncMock(
+            return_value=[self._make_item("a", 0.9)]
+        )
         service._vector_search_facts = AsyncMock(return_value=[])
         service._bm25_search_episodes = AsyncMock(return_value=[])
         service._bm25_search_facts = AsyncMock(return_value=[])
@@ -591,27 +601,45 @@ class TestEmbedQuery:
 
     @pytest.mark.asyncio
     async def test_embed_query_success(self) -> None:
-        """Happy path: returns the embedding vector from the LLM backend."""
-        embedding = [0.1] * 768  # canonical dim (snowflake-arctic-embed-m-v1.5)
-        mock_backend = AsyncMock()
-        mock_backend.embed = AsyncMock(return_value=MagicMock(embeddings=[embedding]))
+        """Happy path: returns the vector from the local embedder."""
+        embedding = [0.1] * 768  # canonical dim (nomic-embed-text-v1.5)
+        embedder = AsyncMock(return_value=[embedding])
 
-        mock_resolve = AsyncMock(return_value=mock_backend)
-        with patch("core.llm.resolve_backend", mock_resolve):
+        with patch("core.embeddings.embed_query", embedder):
             service, _ = self._make_service()
             result = await service._embed_query("test query")
 
         assert result == embedding
-        mock_resolve.assert_awaited_once()
+        embedder.assert_awaited_once_with(["test query"])
+
+    @pytest.mark.asyncio
+    async def test_embed_query_uses_query_prefix(self) -> None:
+        """The query leg must use ``embed_query``, never ``embed_passage``.
+
+        ``nomic-embed-text-v1.5`` is trained with asymmetric search/document
+        prefixes.  Using the passage prefix here would still return 768 valid
+        floats and silently degrade recall, so this is pinned explicitly.
+        """
+        passage = AsyncMock(return_value=[[0.1] * 768])
+        query = AsyncMock(return_value=[[0.2] * 768])
+
+        with (
+            patch("core.embeddings.embed_query", query),
+            patch("core.embeddings.embed_passage", passage),
+        ):
+            service, _ = self._make_service()
+            result = await service._embed_query("test query")
+
+        assert result == [0.2] * 768
+        query.assert_awaited_once()
+        passage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_embed_query_empty_embeddings(self) -> None:
-        """Backend returns no embeddings — SearchLegFailedError is raised."""
-        mock_backend = AsyncMock()
-        mock_backend.embed = AsyncMock(return_value=MagicMock(embeddings=[]))
+        """Embedder returns no vectors — SearchLegFailedError is raised."""
+        embedder = AsyncMock(return_value=[])
 
-        mock_resolve = AsyncMock(return_value=mock_backend)
-        with patch("core.llm.resolve_backend", mock_resolve):
+        with patch("core.embeddings.embed_query", embedder):
             service, _ = self._make_service()
             with pytest.raises(SearchLegFailedError) as exc_info:
                 await service._embed_query("test")
@@ -620,12 +648,10 @@ class TestEmbedQuery:
 
     @pytest.mark.asyncio
     async def test_embed_query_failure(self) -> None:
-        """Backend.embed raises an exception — SearchLegFailedError is raised."""
-        mock_backend = AsyncMock()
-        mock_backend.embed = AsyncMock(side_effect=RuntimeError("embedding API timeout"))
+        """The embedder raises — SearchLegFailedError is raised."""
+        embedder = AsyncMock(side_effect=RuntimeError("onnx inference timeout"))
 
-        mock_resolve = AsyncMock(return_value=mock_backend)
-        with patch("core.llm.resolve_backend", mock_resolve):
+        with patch("core.embeddings.embed_query", embedder):
             service, _ = self._make_service()
             with pytest.raises(SearchLegFailedError) as exc_info:
                 await service._embed_query("test")
@@ -635,14 +661,10 @@ class TestEmbedQuery:
     @pytest.mark.asyncio
     async def test_embed_query_tracks_embedding_dim(self) -> None:
         """``_last_query_embedding_dim`` is set to the length of the embedding vector."""
-        embedding = [0.1] * 768  # canonical dim (snowflake-arctic-embed-m-v1.5)
-        mock_backend = AsyncMock()
-        mock_backend.embed = AsyncMock(
-            return_value=MagicMock(embeddings=[embedding]),
-        )
+        embedding = [0.1] * 768  # canonical dim (nomic-embed-text-v1.5)
+        embedder = AsyncMock(return_value=[embedding])
 
-        mock_resolve = AsyncMock(return_value=mock_backend)
-        with patch("core.llm.resolve_backend", mock_resolve):
+        with patch("core.embeddings.embed_query", embedder):
             service, _ = self._make_service()
             assert service._last_query_embedding_dim is None
 
@@ -651,50 +673,49 @@ class TestEmbedQuery:
         assert service._last_query_embedding_dim == 768
 
     @pytest.mark.asyncio
-    async def test_embed_query_with_org_config(self) -> None:
-        """With org_config, the provider and canonical model go to resolve_backend.
+    async def test_embed_query_wrong_dim_rejected(self) -> None:
+        """A wrong-dim vector is refused, never searched with."""
+        embedder = AsyncMock(return_value=[[0.1] * 512])
 
-        The embedding model is frozen: ``resolve_embed_model`` maps the
-        backend to the canonical ``snowflake-arctic-embed-m-v1.5`` — the
-        legacy per-org ``embedding_model`` value is never forwarded.
+        with patch("core.embeddings.embed_query", embedder):
+            service, _ = self._make_service()
+            with pytest.raises(SearchLegFailedError) as exc_info:
+                await service._embed_query("test")
+
+        assert exc_info.value.detail.get("leg") == "embedding"
+        # The wrapper keeps the original reason in detail, not in str().
+        assert "len 512" in exc_info.value.detail["original_error"]
+
+    @pytest.mark.asyncio
+    async def test_embed_query_ignores_org_config(self) -> None:
+        """Org config is irrelevant to embedding — no provider is resolved.
+
+        Retained from the frozen-model era: the guarantee is now stronger.
+        An org config carrying legacy ``embedding_*`` keys cannot influence
+        which model runs, because there is no provider to route to.
         """
-        from core.embeddings import CANONICAL_EMBED_MODEL
-
         mock_org_config = MagicMock()
         mock_org_config.to_llm_config_dict.return_value = {"provider": "openai"}
-        mock_org_config.embedding_backend = "openai"
-        mock_org_config.embedding_model = "text-embedding-3-small"
-        mock_org_config.embedding_dim = 768
         mock_org_config.reranker_top_k = None
         mock_org_config.reranker_top_n = None
 
-        embedding = [0.1] * 768  # canonical dim (snowflake-arctic-embed-m-v1.5)
-        mock_backend = AsyncMock()
-        mock_backend.embed = AsyncMock(return_value=MagicMock(embeddings=[embedding]))
-
-        mock_db = AsyncMock()
+        embedding = [0.1] * 768  # canonical dim (nomic-embed-text-v1.5)
+        embedder = AsyncMock(return_value=[embedding])
         service = HybridRetriever(
-            db=mock_db,
+            db=AsyncMock(),
             org_id=self.ORG_ID,
             org_config=mock_org_config,
         )
 
-        mock_resolve = AsyncMock(return_value=mock_backend)
-        with patch("core.llm.resolve_backend", mock_resolve):
+        with (
+            patch("core.embeddings.embed_query", embedder),
+            patch("core.llm.resolve_backend") as mock_resolve,
+        ):
             result = await service._embed_query("test")
 
         assert result == embedding
-        mock_resolve.assert_awaited_once_with(
-            provider="openai",
-            org_config={"provider": "openai"},
-            mode="embedding",
-            sink=ANY,
-        )
-        mock_backend.embed.assert_awaited_once_with(
-            ["test"],
-            model=CANONICAL_EMBED_MODEL,
-            metered=True,
-        )
+        embedder.assert_awaited_once_with(["test"])
+        mock_resolve.assert_not_called()
 
 
 @pytest.mark.unit
@@ -722,13 +743,20 @@ class TestVectorSearch:
         """
         service, _ = self._make_service()
         mock_results = [
-            {"id": "ep1", "score": 0.95, "content": "test episode", "role": "assistant"},
+            {
+                "id": "ep1",
+                "score": 0.95,
+                "content": "test episode",
+                "role": "assistant",
+            },
         ]
 
         service._execute_ranked_query = AsyncMock(return_value=mock_results)
 
         results = await service._vector_search_episodes(
-            [0.1, 0.2, 0.3], self.PROJECT_ID, limit=20,
+            [0.1, 0.2, 0.3],
+            self.PROJECT_ID,
+            limit=20,
         )
 
         assert results == mock_results
@@ -739,13 +767,21 @@ class TestVectorSearch:
         """Fact vector search returns results from ``_execute_ranked_query``."""
         service, _ = self._make_service()
         mock_results = [
-            {"id": "f1", "score": 0.92, "content": "test fact", "subject": "S", "predicate": "P"},
+            {
+                "id": "f1",
+                "score": 0.92,
+                "content": "test fact",
+                "subject": "S",
+                "predicate": "P",
+            },
         ]
 
         service._execute_ranked_query = AsyncMock(return_value=mock_results)
 
         results = await service._vector_search_facts(
-            [0.1, 0.2, 0.3], self.PROJECT_ID, limit=20,
+            [0.1, 0.2, 0.3],
+            self.PROJECT_ID,
+            limit=20,
         )
 
         assert results == mock_results
@@ -759,7 +795,9 @@ class TestVectorSearch:
         service._execute_ranked_query = AsyncMock(return_value=[])
 
         results = await service._vector_search_episodes(
-            [0.1, 0.2, 0.3], self.PROJECT_ID, limit=20,
+            [0.1, 0.2, 0.3],
+            self.PROJECT_ID,
+            limit=20,
         )
 
         assert results == []
@@ -772,7 +810,9 @@ class TestVectorSearch:
         service._execute_ranked_query = AsyncMock(return_value=[])
 
         results = await service._vector_search_facts(
-            [0.1, 0.2, 0.3], self.PROJECT_ID, limit=20,
+            [0.1, 0.2, 0.3],
+            self.PROJECT_ID,
+            limit=20,
         )
 
         assert results == []
@@ -797,7 +837,9 @@ class TestVectorSearch:
         service._execute_ranked_query = AsyncMock(return_value=mock_results)
 
         results = await service._vector_search_facts(
-            [0.1, 0.2, 0.3], self.PROJECT_ID, limit=20,
+            [0.1, 0.2, 0.3],
+            self.PROJECT_ID,
+            limit=20,
         )
 
         assert len(results) == 1
@@ -1025,7 +1067,9 @@ class TestBM25Search:
         service._execute_ranked_query = AsyncMock(return_value=mock_results)
 
         results = await service._bm25_search_facts(
-            "test", self.PROJECT_ID, limit=20,
+            "test",
+            self.PROJECT_ID,
+            limit=20,
         )
 
         assert len(results) == 1

@@ -1,7 +1,8 @@
 """Embedding worker for facts — generates pgvector embeddings for extracted facts.
 
-Runs after facts are extracted from episodes.  Generates embeddings via
-the configured BYOK LLM backend and stores them in ``facts.embedding``.
+Runs after facts are extracted from episodes.  Generates embeddings with
+the single local embedder (``core.embeddings.embed_passage``) and stores
+them in ``facts.embedding``.
 
 Queue: high-priority (real-time ingestion).
 """
@@ -12,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from core.exceptions import SearchLegFailedError
 from workers.tasks.base import with_retry
 
 if TYPE_CHECKING:
@@ -79,14 +79,11 @@ async def embed_fact(
 ) -> None:
     """Generate an embedding for a fact and store it in ``facts.embedding``.
 
-    The embedding backend comes from the per-org config
-    (``org_cfg.embedding_backend``); the model is the frozen canonical
-    model (``core.embeddings.resolve_embed_model``). There is no env-var
-    fallback — if no backend is configured the task raises. Any vector
-    that is not exactly ``CANONICAL_EMBED_DIM`` raises
-    ``ExternalServiceError`` and is never stored (no retire — a dim
-    mismatch under the freeze means the provider serves the wrong model
-    and must stay loud until fixed).
+    Embeds with the single local embedder (``core.embeddings.embed_passage``)
+    — the document prefix, since a fact is written to the corpus side of
+    the vector store.  Any vector that is not exactly ``CANONICAL_EMBED_DIM``
+    raises ``ExternalServiceError`` and is never stored (no retire — see
+    the note at the validation step below).
 
     Args:
         ctx: ARQ worker context (unused — required by ARQ contract).
@@ -97,10 +94,7 @@ async def embed_fact(
         **kwargs: Additional context (org_id, user_id) forwarded from the caller.
 
     Raises:
-        SearchLegFailedError: If the org config cannot be fetched or no
-            embedding backend is configured (same taxonomy as
-            ``embed_episode`` — ARQ retries).
-        ExternalServiceError: If the provider returns a non-canonical-dim
+        ExternalServiceError: If the embedder returns a non-canonical-dim
             vector.
     """
     if trace_id:
@@ -111,13 +105,7 @@ async def embed_fact(
 
     from core.config import settings
     from core.db import get_async_session
-    from core.embeddings import (
-        CANONICAL_EMBED_DIM,
-        resolve_embed_model,
-        validate_embedding_dim,
-    )
-    from core.llm import resolve_backend
-    from services.usage_service import make_sink
+    from core.embeddings import CANONICAL_EMBED_DIM, embed_passage
 
     logger.info("embed_fact.started", fact_id=fact_id, trace_id=trace_id)
 
@@ -151,80 +139,17 @@ async def embed_fact(
                 return
             content = row[0]
 
-    # ── 0b. Fetch per-organization config if org_id is available ─────────
-    _org_id = kwargs.get("org_id")
-    import uuid
-
-    org_cfg = None
-    if _org_id:
-        try:
-            from core.org_config import get_org_config
-
-            bao_client = ctx.get("openbao_client") if isinstance(ctx, dict) else None
-            if bao_client is not None:
-                org_cfg = await get_org_config(
-                    uuid.UUID(_org_id), redis=None, bao_client=bao_client
-                )
-            else:
-                from core.config import BootstrapSettings
-                from core.openbao import OpenBaoClient
-
-                bootstrap = BootstrapSettings()
-                async with OpenBaoClient(
-                    bootstrap.OPENBAO_ADDR,
-                    bootstrap.OPENBAO_ROLE_ID,
-                    bootstrap.OPENBAO_SECRET_ID,
-                    timeout=10.0,
-                ) as _tmp_bao:
-                    org_cfg = await get_org_config(
-                        uuid.UUID(_org_id), redis=None, bao_client=_tmp_bao
-                    )
-        except Exception as exc:
-            logger.warning(
-                "embed_fact.org_config_fetch_failed",
-                org_id=_org_id,
-                exc_info=True,
-            )
-            raise SearchLegFailedError(
-                leg_name="embedding",
-                message=f"Failed to fetch org config for org {_org_id}: {exc}",
-                original_error=str(exc),
-            ) from exc
-
-    if org_cfg is None:
-        raise SearchLegFailedError(
-            leg_name="embedding",
-            message=f"Org config not found for org {_org_id}",
-        )
-    if org_cfg.embedding_backend is None:
-        raise SearchLegFailedError(
-            leg_name="embedding",
-            message=f"No embedding backend configured for org {_org_id}",
-            original_error=f"org_cfg.embedding_backend is None for org {_org_id}",
-        )
-
-    _embedding_backend = org_cfg.embedding_backend
-    _embedding_model = resolve_embed_model(org_cfg.embedding_backend)
-    _org_config_dict = org_cfg.to_llm_config_dict()
-
-    # ── 1. Resolve the embedding backend ──────────────────────────────────
-    sink = (
-        make_sink(session_factory, org_id=uuid.UUID(str(_org_id)), worker="embed_fact")
-        if _org_id
-        else None
-    )
-    llm = await resolve_backend(
-        provider=_embedding_backend,
-        org_config=_org_config_dict,
-        mode="embedding",
-        sink=sink,
-    )
-
-    # ── 2. Generate embedding ────────────────────────────────────────────
+    # ── 1. Generate embedding ────────────────────────────────────────────
     try:
-        result = await llm.embed([content], model=_embedding_model, metered=True)
-        embedding = result.embeddings[0]
+        embedding = (await embed_passage([content]))[0]
     except Exception as e:
+        # Deliberately no retire on a dimension mismatch: ``embed_passage``
+        # rejects it before any vector is produced, which means the local
+        # model itself is serving the wrong width (operator fix required,
+        # retrying cannot succeed). The fact stays NULL/NULL so
+        # ``reconcile_enrichment`` keeps it visible via re-enqueue.
+        # ``_is_retryable`` returns True for that ``ExternalServiceError``
+        # (no 4xx ``status_code``), so it lands in the else-branch below.
         if not _is_retryable(e):
             # Permanent 4xx (bad request, unknown model, rejected params):
             # retrying cannot succeed, so retire the fact and raise.
@@ -243,18 +168,13 @@ async def embed_fact(
             )
         raise
 
-    # ── 3. Validate canonical dimension — fail loud, never store ─────────
-    # Deliberately no retire: under the freeze a dim mismatch means the
-    # provider serves the wrong model (operator fix required). The fact
-    # stays NULL/NULL so reconcile keeps it visible via re-enqueue.
-    validate_embedding_dim(embedding, source="embed_fact")
-
-    # ── 4. Store in pgvector ──────────────────────────────────────────────
+    # ── 2. Store in pgvector ──────────────────────────────────────────────
+    # ``embed_passage`` already validated the canonical width and refused
+    # anything else, so reaching here means the vector is storable.
     # The pgvector asyncpg codec IS registered via ``init_db_engine``, so
     # the vector goes in as native ``list[float]`` — the codec encodes it
     # and the static ``::vector(768)`` cast only asserts the dimension.
     # Passing a ``str`` literal here breaks decoding (asyncpg DataError).
-    # The dimension was validated above — the cast cannot silently reshape.
     try:
         async with session_factory() as db:
             await db.execute(

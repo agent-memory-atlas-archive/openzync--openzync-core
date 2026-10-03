@@ -41,10 +41,10 @@ class TestOrgConfigBase:
 
     def test_partial_construction(self) -> None:
         """Constructing with a subset of fields should work."""
-        cfg = OrgConfigBase(llm_backend="openai", embedding_dim=1536)
+        cfg = OrgConfigBase(llm_backend="openai", llm_model="gpt-4o-mini")
         assert cfg.llm_backend == "openai"
-        assert cfg.embedding_dim == 1536
-        assert cfg.llm_model is None  # not set
+        assert cfg.llm_model == "gpt-4o-mini"
+        assert cfg.graph_search_type is None  # not set
         assert cfg.graph_backend == "falkordb"  # default when not provided
 
 
@@ -112,48 +112,6 @@ class TestOrgConfigBaseToDict:
         cfg = OrgConfigBase(llm_temperature=2.0)
         assert cfg.to_llm_config_dict()["temperature"] == 2.0
 
-    def test_to_embedding_config_dict(self) -> None:
-        """to_embedding_config_dict() should return flat embedding fields."""
-        cfg = OrgConfigBase(
-            embedding_backend="ollama",
-            embedding_model="nomic-embed-text",
-            embedding_dim=768,
-        )
-        d = cfg.to_embedding_config_dict()
-        assert d["embedding_backend"] == "ollama"
-        assert d["embedding_model"] == "nomic-embed-text"
-        assert d["embedding_dim"] == 768
-
-    def test_to_embedding_config_dict_excludes_none(self) -> None:
-        """Fields with None values should be omitted from the dict."""
-        cfg = OrgConfigBase()
-        d = cfg.to_embedding_config_dict()
-        assert d == {}
-
-    def test_to_embedding_config_dict_get_with_canonical_defaults(self) -> None:
-        """Callers must read via ``.get()`` with canonical defaults.
-
-        ``to_embedding_config_dict`` omits ``None`` fields (frozen legacy
-        ``embedding_model``/``embedding_dim`` pass through read-only), so
-        callers needing a guaranteed value default to the canonical
-        model/dim from ``core.embeddings``. No prod callers exist today —
-        this pins the documented contract.
-        """
-        from core.embeddings import CANONICAL_EMBED_DIM, CANONICAL_EMBED_MODEL
-
-        d = OrgConfigBase().to_embedding_config_dict()
-        assert d.get("embedding_model", CANONICAL_EMBED_MODEL) == CANONICAL_EMBED_MODEL
-        assert d.get("embedding_dim", CANONICAL_EMBED_DIM) == CANONICAL_EMBED_DIM
-
-        # Explicit legacy values still pass through untouched.
-        legacy = OrgConfigBase(
-            embedding_model="text-embedding-3-small", embedding_dim=1536
-        ).to_embedding_config_dict()
-        assert legacy.get("embedding_model", CANONICAL_EMBED_MODEL) == (
-            "text-embedding-3-small"
-        )
-        assert legacy.get("embedding_dim", CANONICAL_EMBED_DIM) == 1536
-
 
 class TestUpdateOrgConfigRequest:
     """Validate the partial-update request schema."""
@@ -178,17 +136,11 @@ class TestUpdateOrgConfigRequest:
         dumped = req.model_dump(exclude_unset=True)
         assert dumped == {"llm_backend": None}
 
-    def test_embedding_dim_validation(self) -> None:
-        """embedding_dim must be between 64 and 4096."""
-        with pytest.raises(Exception, match="Input should be greater than or equal to 64"):
-            UpdateOrgConfigRequest(embedding_dim=16)
-
-        with pytest.raises(Exception, match="Input should be less than or equal to 4096"):
-            UpdateOrgConfigRequest(embedding_dim=8192)
-
     def test_graph_max_traversal_depth_validation(self) -> None:
         """graph_max_traversal_depth must be between 1 and 10."""
-        with pytest.raises(Exception, match="Input should be greater than or equal to 1"):
+        with pytest.raises(
+            Exception, match="Input should be greater than or equal to 1"
+        ):
             UpdateOrgConfigRequest(graph_max_traversal_depth=0)
 
         with pytest.raises(Exception, match="Input should be less than or equal to 10"):
@@ -201,8 +153,13 @@ class TestUpdateOrgConfigRequest:
 
     def test_falkordb_and_surrealdb_allowed(self) -> None:
         """falkordb and surrealdb graph_backends are still allowed."""
-        assert UpdateOrgConfigRequest(graph_backend="falkordb").graph_backend == "falkordb"
-        assert UpdateOrgConfigRequest(graph_backend="surrealdb").graph_backend == "surrealdb"
+        assert (
+            UpdateOrgConfigRequest(graph_backend="falkordb").graph_backend == "falkordb"
+        )
+        assert (
+            UpdateOrgConfigRequest(graph_backend="surrealdb").graph_backend
+            == "surrealdb"
+        )
         assert UpdateOrgConfigRequest(graph_backend="none").graph_backend == "none"
         assert UpdateOrgConfigRequest(graph_backend=None).graph_backend is None
 

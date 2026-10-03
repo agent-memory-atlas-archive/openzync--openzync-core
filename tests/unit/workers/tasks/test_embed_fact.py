@@ -8,12 +8,24 @@ from uuid import uuid4
 
 import pytest
 
-from core.exceptions import ExternalServiceError, SearchLegFailedError
+from core.exceptions import ExternalServiceError
 
 _FACT_ID = str(uuid4())
 _ORG_ID = str(uuid4())
 _CONTENT = "Test fact content for embedding."
 _TRACE_ID = "trace-202"
+
+
+@pytest.fixture
+def embedder():
+    """Patch the single embedder entrypoint; auto-undone after the test.
+
+    Yields:
+        The ``AsyncMock`` standing in for ``embed_passage``.
+    """
+    mock = AsyncMock(return_value=[[0.2] * 768])
+    with patch("core.embeddings.embed_passage", mock):
+        yield mock
 
 
 @pytest.mark.unit
@@ -36,34 +48,51 @@ class TestEmbedFact:
         return {
             "db_engine": MagicMock(),
             "db_session_factory": self._factory(db),
-            "openbao_client": MagicMock(),
         }
 
-    def _make_org_config(self, **overrides) -> MagicMock:
-        cfg = MagicMock()
-        cfg.embedding_backend = overrides.get("embedding_backend", "openai")
-        cfg.embedding_model = overrides.get("embedding_model", "text-embedding-3-small")
-        cfg.embedding_dim = overrides.get("embedding_dim", 768)
-        return cfg
+    @pytest.mark.asyncio
+    async def test_success(self, embedder: AsyncMock) -> None:
+        """Fact embedding generated and stored successfully."""
+
+        db = self._make_db()
+        from workers.tasks.embed_fact import embed_fact
+
+        await embed_fact(
+            ctx=self._ctx(db),
+            fact_id=_FACT_ID,
+            org_id=_ORG_ID,
+            content=_CONTENT,
+            trace_id=_TRACE_ID,
+        )
 
     @pytest.mark.asyncio
-    async def test_success(self) -> None:
-        """Fact embedding generated and stored successfully."""
-        embedding = [0.2] * 768
+    async def test_fact_not_found(self) -> None:
+        """Missing fact logs and returns (does not raise)."""
 
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
-        ):
-            mock_cfg.return_value = self._make_org_config()
+        db = self._make_db()
+        db.execute.return_value.one_or_none.return_value = None
 
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
+        from workers.tasks.embed_fact import embed_fact
 
+        # content=None triggers DB fetch which returns nothing → log + return
+        await embed_fact(
+            ctx=self._ctx(db),
+            fact_id=_FACT_ID,
+            org_id=_ORG_ID,
+            content=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_org_config_consulted(self, embedder: AsyncMock) -> None:
+        """Fact embedding needs no org config, even when one is unavailable.
+
+        Replaces the old "no embedding backend configured" case: there is no
+        such configuration any more, so the guarantee is that ``org_id`` is
+        accepted by the task but never used to resolve a provider.
+        """
+        with patch("core.org_config.get_org_config") as mock_get_cfg:
             db = self._make_db()
+
             from workers.tasks.embed_fact import embed_fact
 
             await embed_fact(
@@ -71,116 +100,44 @@ class TestEmbedFact:
                 fact_id=_FACT_ID,
                 org_id=_ORG_ID,
                 content=_CONTENT,
-                trace_id=_TRACE_ID,
             )
 
-            mock_llm.embed.assert_called_once()
+            mock_get_cfg.assert_not_called()
+            embedder.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_fact_not_found(self) -> None:
-        """Missing fact logs and returns (does not raise)."""
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-        ):
-            mock_cfg.return_value = self._make_org_config()
+    async def test_embedding_failure(self, embedder: AsyncMock) -> None:
+        """Embedder failure propagates."""
+        embedder.side_effect = Exception("ONNX inference error")
 
-            db = self._make_db()
-            db.execute.return_value.one_or_none.return_value = None
+        db = self._make_db()
+        ctx = self._ctx(db)
 
-            from workers.tasks.embed_fact import embed_fact
+        from workers.tasks.embed_fact import embed_fact
 
-            # content=None triggers DB fetch which returns nothing → log + return
-            await embed_fact(
-                ctx=self._ctx(db),
-                fact_id=_FACT_ID,
-                org_id=_ORG_ID,
-                content=None,
-            )
-
-    @pytest.mark.asyncio
-    async def test_no_embedding_backend(self) -> None:
-        """No embedding backend configured → raises."""
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-        ):
-            cfg = self._make_org_config()
-            cfg.embedding_backend = None
-            mock_cfg.return_value = cfg
-
-            db = self._make_db()
-            ctx = self._ctx(db)
-
-            from workers.tasks.embed_fact import embed_fact
-
-            # embed_fact.py:198 — ``org_cfg.embedding_backend is None`` raises
-            # ``SearchLegFailedError``.  The message interpolates the org id,
-            # so only the stable literal prefix is pinned.
-            with pytest.raises(
-                SearchLegFailedError, match="No embedding backend configured"
-            ):
-                await embed_fact(
-                    ctx=ctx,
-                    fact_id=_FACT_ID,
-                    org_id=_ORG_ID,
-                    content=_CONTENT,
-                )
-
-    @pytest.mark.asyncio
-    async def test_embedding_failure(self) -> None:
-        """Embedding API failure propagates."""
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
-        ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_llm.embed.side_effect = Exception("Embedding API error")
-            mock_llm_cls.return_value = mock_llm
-
-            db = self._make_db()
-            ctx = self._ctx(db)
-
-            from workers.tasks.embed_fact import embed_fact
-
-            with pytest.raises(Exception, match="Embedding API error"):
-                await embed_fact(
-                    ctx=ctx,
-                    fact_id=_FACT_ID,
-                    org_id=_ORG_ID,
-                    content=_CONTENT,
-                )
-
-    @pytest.mark.asyncio
-    async def test_empty_content(self) -> None:
-        """Empty content still generates embedding."""
-        embedding = [0.2] * 768
-
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
-        ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
-
-            db = self._make_db()
-            ctx = self._ctx(db)
-
-            from workers.tasks.embed_fact import embed_fact
-
+        with pytest.raises(Exception, match="ONNX inference error"):
             await embed_fact(
                 ctx=ctx,
                 fact_id=_FACT_ID,
                 org_id=_ORG_ID,
-                content="",
+                content=_CONTENT,
             )
 
-            mock_llm.embed.assert_called_once()
+    @pytest.mark.asyncio
+    async def test_empty_content(self, embedder: AsyncMock) -> None:
+        """Empty content still generates embedding."""
+
+        db = self._make_db()
+        ctx = self._ctx(db)
+
+        from workers.tasks.embed_fact import embed_fact
+
+        await embed_fact(
+            ctx=ctx,
+            fact_id=_FACT_ID,
+            org_id=_ORG_ID,
+            content="",
+        )
 
     @pytest.mark.asyncio
     async def test_lazy_import(self) -> None:
@@ -193,68 +150,63 @@ class TestEmbedFact:
     async def test_dimension_mismatch(self) -> None:
         """A non-canonical-dim vector raises ExternalServiceError (fail loud).
 
-        This is the single negative-dim case: the canonical model is
-        ``snowflake-arctic-embed-m-v1.5`` at 768 dims — anything else is
-        refused, never stored.
+        The canonical model is ``nomic-ai/nomic-embed-text-v1.5`` at 768
+        dims — anything else is refused, never stored.
+
+        Note the fake is installed at the *model* level, not at
+        ``embed_passage``: dimension validation now lives inside the
+        embedder, so stubbing the entrypoint would bypass the very check
+        this test exists to prove.  The real ``embed_passage`` runs and
+        rejects the 512-wide vector itself.
         """
-        embedding = [0.2] * 512  # Wrong dimension
+        import numpy as np
+
+        class _WrongDimModel:
+            """Stands in for ``fastembed.TextEmbedding`` — wrong width out."""
+
+            def passage_embed(self, texts, **_kwargs):
+                # Non-zero filler on purpose: ``embed_passage`` normalises before
+                # validating width, so an all-zeros row would trip the zero-norm
+                # guard first and mask the width check under test.
+                return iter(np.ones((len(texts), 512), dtype=np.float32))
+
+        db = self._make_db()
+        ctx = self._ctx(db)
+
+        from core import embeddings as embeddings_mod
+        from workers.tasks.embed_fact import embed_fact
 
         with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
+            patch.object(embeddings_mod, "_MODEL", _WrongDimModel()),
+            pytest.raises(ExternalServiceError) as exc_info,
         ):
-            mock_cfg.return_value = self._make_org_config(embedding_dim=768)
+            await embed_fact(
+                ctx=ctx,
+                fact_id=_FACT_ID,
+                org_id=_ORG_ID,
+                content=_CONTENT,
+            )
 
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
-
-            db = self._make_db()
-            ctx = self._ctx(db)
-
-            from workers.tasks.embed_fact import embed_fact
-
-            with pytest.raises(ExternalServiceError) as exc_info:
-                await embed_fact(
-                    ctx=ctx,
-                    fact_id=_FACT_ID,
-                    org_id=_ORG_ID,
-                    content=_CONTENT,
-                )
-
-            # The message is assembled dynamically (it interpolates the actual
-            # length and CANONICAL_EMBED_DIM), so assert on the stable literal
-            # tail plus the structured detail rather than a brittle regex.
-            assert "Refusing to store." in str(exc_info.value)
-            assert exc_info.value.detail == {
-                "source": "embed_fact",
-                "got": 512,
-                "expected": 768,
-            }
+        # The message is assembled dynamically (it interpolates the actual
+        # length and CANONICAL_EMBED_DIM), so assert on the stable literal
+        # tail plus the structured detail rather than a brittle regex.
+        assert "Refusing to store." in str(exc_info.value)
+        assert exc_info.value.detail == {
+            "source": "embed_passage",
+            "got": 512,
+            "expected": 768,
+        }
 
     # ── Coverage gap: engine/session/bao_client edge cases ──────────────────
 
     @pytest.mark.asyncio
-    async def test_no_db_engine_in_ctx(self) -> None:
+    async def test_no_db_engine_in_ctx(self, embedder: AsyncMock) -> None:
         """Missing db_engine → creates own engine + session factory, disposes."""
-        embedding = [0.2] * 768
 
         with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
             patch("core.db.init_db_engine") as mock_init_engine,
             patch("core.db.get_async_session") as mock_get_session,
         ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
-
             mock_engine = AsyncMock()
             mock_engine.dispose = AsyncMock()
             mock_init_engine.return_value = mock_engine
@@ -276,129 +228,29 @@ class TestEmbedFact:
                 content=_CONTENT,
             )
 
-            mock_llm.embed.assert_called_once()
+            embedder.assert_awaited_once()
             mock_init_engine.assert_called_once()
             mock_get_session.assert_called_once_with(mock_engine)
             mock_engine.dispose.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_content_fetched_from_db(self) -> None:
+    async def test_content_fetched_from_db(self, embedder: AsyncMock) -> None:
         """Content not provided → fetched from DB successfully."""
-        embedding = [0.2] * 768
         db_content = "fact content from database"
 
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
-        ):
-            mock_cfg.return_value = self._make_org_config()
+        db = self._make_db()
+        row = MagicMock()
+        row.__getitem__.return_value = db_content
+        db.execute.return_value.one_or_none.return_value = row
 
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
+        from workers.tasks.embed_fact import embed_fact
 
-            db = self._make_db()
-            row = MagicMock()
-            row.__getitem__.return_value = db_content
-            db.execute.return_value.one_or_none.return_value = row
-
-            from workers.tasks.embed_fact import embed_fact
-
-            await embed_fact(
-                ctx=self._ctx(db),
-                fact_id=_FACT_ID,
-                org_id=_ORG_ID,
-                content=None,
-            )
-
-            mock_llm.embed.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_no_bao_client_in_ctx(self) -> None:
-        """No openbao_client in ctx → uses BootstrapSettings + OpenBaoClient."""
-        embedding = [0.2] * 768
-
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
-            patch("core.config.BootstrapSettings") as mock_bs,
-            patch("core.openbao.OpenBaoClient") as mock_bao_cls,
-        ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
-
-            mock_bao = MagicMock()
-            mock_bao.__aenter__ = AsyncMock(return_value=mock_bao)
-            mock_bao.__aexit__ = AsyncMock(return_value=None)
-            mock_bao_cls.return_value = mock_bao
-
-            db = self._make_db()
-            # ctx WITHOUT openbao_client → triggers BootstrapSettings path
-            ctx = {"db_engine": MagicMock(), "db_session_factory": self._factory(db)}
-
-            from workers.tasks.embed_fact import embed_fact
-
-            await embed_fact(
-                ctx=ctx,
-                fact_id=_FACT_ID,
-                org_id=_ORG_ID,
-                content=_CONTENT,
-            )
-
-            mock_llm.embed.assert_called_once()
-            mock_bs.assert_called_once()
-            mock_bao_cls.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_org_config_none(self) -> None:
-        """get_org_config returns None → SearchLegFailedError (no backend)."""
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-        ):
-            mock_cfg.return_value = None
-
-            db = self._make_db()
-            from workers.tasks.embed_fact import embed_fact
-
-            with pytest.raises(SearchLegFailedError, match="Org config not found"):
-                await embed_fact(
-                    ctx=self._ctx(db),
-                    fact_id=_FACT_ID,
-                    org_id=_ORG_ID,
-                    content=_CONTENT,
-                )
-
-    @pytest.mark.asyncio
-    async def test_org_config_fetch_raises(self) -> None:
-        """get_org_config raises → wrapped as SearchLegFailedError.
-
-        Covers the except Exception block in the org config fetch
-        try/except — the fetch failure becomes a leg failure (ARQ retries).
-        """
-        with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-        ):
-            mock_cfg.side_effect = ValueError("Bao returned garbage")
-
-            db = self._make_db()
-            from workers.tasks.embed_fact import embed_fact
-
-            with pytest.raises(
-                SearchLegFailedError, match="Failed to fetch org config"
-            ):
-                await embed_fact(
-                    ctx=self._ctx(db),
-                    fact_id=_FACT_ID,
-                    org_id=_ORG_ID,
-                    content=_CONTENT,
-                )
+        await embed_fact(
+            ctx=self._ctx(db),
+            fact_id=_FACT_ID,
+            org_id=_ORG_ID,
+            content=None,
+        )
 
 
 def _exc_with_status(status_code: int) -> Exception:
@@ -455,34 +307,22 @@ class TestEmbedFactRetryBehaviour:
         return {
             "db_engine": MagicMock(),
             "db_session_factory": self._factory(db),
-            "openbao_client": MagicMock(),
         }
-
-    def _make_org_config(self, **overrides) -> MagicMock:
-        cfg = MagicMock()
-        cfg.embedding_backend = overrides.get("embedding_backend", "openai")
-        cfg.embedding_model = overrides.get("embedding_model", "text-embedding-3-small")
-        cfg.embedding_dim = overrides.get("embedding_dim", 768)
-        return cfg
 
     @staticmethod
     def _executed_sql(db: AsyncMock) -> list[str]:
         return [str(call.args[0]) for call in db.execute.call_args_list]
 
     @pytest.mark.asyncio
-    async def test_non_retryable_400_retires_without_retry(self) -> None:
-        """A 400 from the backend retires the fact and raises immediately."""
+    async def test_non_retryable_400_retires_without_retry(
+        self, embedder: AsyncMock
+    ) -> None:
+        """A 400 from the embedder retires the fact and raises immediately."""
+        embedder.side_effect = _exc_with_status(400)
+
         with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
             patch("asyncio.sleep", new=AsyncMock()) as mock_sleep,
         ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_llm.embed.side_effect = _exc_with_status(400)
-            mock_llm_cls.return_value = mock_llm
-
             db = self._make_db()
             ctx = self._ctx(db)
 
@@ -499,7 +339,7 @@ class TestEmbedFactRetryBehaviour:
             elapsed = time.monotonic() - start
 
             # No retry loop: single attempt, no backoff sleep, fast return.
-            mock_llm.embed.assert_called_once()
+            embedder.assert_awaited_once()
             mock_sleep.assert_not_awaited()
             assert elapsed < 1.0
             # Fact retired: embedded_at set, embedding stays NULL.
@@ -508,22 +348,15 @@ class TestEmbedFactRetryBehaviour:
             assert not any("CAST(:embedding AS vector(768))" in sql for sql in executed)
 
     @pytest.mark.asyncio
-    async def test_transient_error_retries_then_succeeds(self) -> None:
+    async def test_transient_error_retries_then_succeeds(
+        self, embedder: AsyncMock
+    ) -> None:
         """A transient failure is retried and a later success is stored."""
-        embedding = [0.2] * 768
+        embedder.side_effect = [Exception("connection reset"), [[0.2] * 768]]
+
         with (
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
             patch("asyncio.sleep", new=AsyncMock()) as mock_sleep,
         ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.side_effect = [Exception("connection reset"), mock_result]
-            mock_llm_cls.return_value = mock_llm
-
             db = self._make_db()
             ctx = self._ctx(db)
 
@@ -536,7 +369,7 @@ class TestEmbedFactRetryBehaviour:
                 content=_CONTENT,
             )
 
-            assert mock_llm.embed.call_count == 2
+            assert embedder.await_count == 2
             mock_sleep.assert_awaited_once()
             executed = self._executed_sql(db)
             assert any("CAST(:embedding AS vector(768))" in sql for sql in executed)

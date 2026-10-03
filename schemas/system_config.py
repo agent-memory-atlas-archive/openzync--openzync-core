@@ -74,9 +74,9 @@ class SystemConfigUpdate(BaseModel):
     llm_model: str | None = None
     llm_temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     llm_max_tokens: int | None = Field(default=None, ge=1)
-    embedding_backend: str | None = None
-    embedding_model: str | None = None
-    embedding_dim: int | None = Field(default=None, ge=64, le=4096)
+    # ⚠️ BREAKING: embedding_backend / embedding_model / embedding_dim were
+    # write-only (nothing ever read them back) and are removed.  Embeddings
+    # are a local ONNX model with no configuration surface.
     graph_backend: str | None = None
     graph_search_type: str | None = None
     graph_max_traversal_depth: int | None = Field(default=None, ge=1, le=10)
@@ -122,9 +122,6 @@ class SystemConfigResponse(BaseModel):
     llm_model: str | None = None
     llm_temperature: float | None = None
     llm_max_tokens: int | None = None
-    embedding_backend: str | None = None
-    embedding_model: str | None = None
-    embedding_dim: int | None = None
     graph_backend: str | None = None
     graph_search_type: str | None = None
     graph_max_traversal_depth: int | None = None
@@ -152,6 +149,4 @@ class SystemConfigResponse(BaseModel):
 
 #: Every key ``core.system_config`` may read from / write to the OpenBao
 #: system secret.  Single source of truth for the whitelist.
-SYSTEM_CONFIG_WHITELIST: frozenset[str] = frozenset(
-    SystemConfigResponse.model_fields
-)
+SYSTEM_CONFIG_WHITELIST: frozenset[str] = frozenset(SystemConfigResponse.model_fields)

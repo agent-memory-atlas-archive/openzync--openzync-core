@@ -9,3 +9,11 @@ SQLAlchemy==2.0.50
 # production CPU (via models -> pgvector -> numpy, hit in migrate and boot);
 # 2.2.6 is the latest pre-baseline 2.2.x (full-tree resolver check separate).
 numpy==2.2.6
+# The embedder is now a pinned, in-process ONNX model (core/embeddings.py) — it
+# runs on every API boot, so a float here re-opens the same class of outage as
+# the SQLAlchemy float above. 0.8.1 is the first release whose declared
+# onnxruntime floor accepts 1.23+; onnxruntime 1.30.0 is the newest release
+# before its own wheel-baseline bump. Verified: fastembed 0.8.1 requires
+# numpy>=1.26 (no upper bound on 3.12), so numpy==2.2.6 above still resolves.
+fastembed==0.8.1
+onnxruntime==1.30.0

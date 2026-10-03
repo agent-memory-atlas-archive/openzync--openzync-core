@@ -1,4 +1,5 @@
 """Unit tests for embed_episode task."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,6 +12,18 @@ _ORG_ID = str(uuid4())
 _PROJECT_ID = str(uuid4())
 _CONTENT = "Test episode content for embedding."
 _TRACE_ID = "trace-101"
+
+
+@pytest.fixture
+def embedder():
+    """Patch the single embedder entrypoint; auto-undone after the test.
+
+    Yields:
+        The ``AsyncMock`` standing in for ``embed_passage``.
+    """
+    mock = AsyncMock(return_value=[[0.1] * 768])
+    with patch("core.embeddings.embed_passage", mock):
+        yield mock
 
 
 @pytest.mark.unit
@@ -32,35 +45,15 @@ class TestEmbedEpisode:
         return {
             "db_engine": MagicMock(),
             "db_session_factory": self._factory(db),
-            "openbao_client": MagicMock(),
         }
 
-    def _make_org_config(self, **overrides) -> MagicMock:
-        cfg = MagicMock()
-        cfg.embedding_backend = overrides.get("embedding_backend", "openai")
-        cfg.embedding_model = overrides.get("embedding_model", "text-embedding-3-small")
-        cfg.embedding_dim = overrides.get("embedding_dim", 768)
-        return cfg
-
     @pytest.mark.asyncio
-    async def test_success(self) -> None:
+    async def test_success(self, embedder: AsyncMock) -> None:
         """Embedding generated and stored successfully."""
-        embedding = [0.1] * 768
-
         with (
             patch("workers.tasks.base.with_retry", lambda **kw: lambda f: f),
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
             patch("repositories.episode_repository.EpisodeRepository") as mock_repo_cls,
         ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
-
             episode = MagicMock()
             episode.id = _EPISODE_ID
             episode.enrichment_status = 0
@@ -81,7 +74,7 @@ class TestEmbedEpisode:
                 trace_id=_TRACE_ID,
             )
 
-            mock_llm.embed.assert_called_once()
+            embedder.assert_awaited_once()
             mock_repo.apply_enrichment_bits.assert_called_once()
 
     @pytest.mark.asyncio
@@ -136,17 +129,20 @@ class TestEmbedEpisode:
                 )
 
     @pytest.mark.asyncio
-    async def test_no_embedding_backend(self) -> None:
-        """No embedding backend configured → raises."""
+    async def test_embedder_never_queried_for_org_config(
+        self, embedder: AsyncMock
+    ) -> None:
+        """Embedding needs no org config — the ARQ ctx is not consulted for it.
+
+        Guards the regression that re-introduced a per-org embedding
+        backend: a stubbed org config would be silently ignored if some
+        caller reached for it again.
+        """
         with (
             patch("workers.tasks.base.with_retry", lambda **kw: lambda f: f),
-            patch("core.org_config.get_org_config") as mock_cfg,
+            patch("core.org_config.get_org_config") as mock_get_cfg,
             patch("repositories.episode_repository.EpisodeRepository") as mock_repo_cls,
         ):
-            cfg = self._make_org_config()
-            cfg.embedding_backend = None
-            mock_cfg.return_value = cfg
-
             episode = MagicMock()
             episode.id = _EPISODE_ID
             episode.enrichment_status = 0
@@ -158,29 +154,24 @@ class TestEmbedEpisode:
             db = self._make_db()
             from workers.tasks.embed_episode import embed_episode
 
-            with pytest.raises(Exception):
-                await embed_episode(
-                    ctx=self._ctx(db),
-                    episode_id=_EPISODE_ID,
-                    org_id=_ORG_ID,
-                    project_id=_PROJECT_ID,
-                    content=_CONTENT,
-                )
+            await embed_episode(
+                ctx=self._ctx(db),
+                episode_id=_EPISODE_ID,
+                org_id=_ORG_ID,
+                project_id=_PROJECT_ID,
+                content=_CONTENT,
+            )
+
+            mock_get_cfg.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_embedding_failure(self) -> None:
+    async def test_embedding_failure(self, embedder: AsyncMock) -> None:
         """Embedding API failure propagates."""
         with (
             patch("workers.tasks.base.with_retry", lambda **kw: lambda f: f),
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
             patch("repositories.episode_repository.EpisodeRepository") as mock_repo_cls,
         ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_llm.embed.side_effect = Exception("OpenAI API error")
-            mock_llm_cls.return_value = mock_llm
+            embedder.side_effect = Exception("ONNX inference error")
 
             episode = MagicMock()
             episode.id = _EPISODE_ID
@@ -193,7 +184,7 @@ class TestEmbedEpisode:
             db = self._make_db()
             from workers.tasks.embed_episode import embed_episode
 
-            with pytest.raises(Exception, match="OpenAI API error"):
+            with pytest.raises(Exception, match="ONNX inference error"):
                 await embed_episode(
                     ctx=self._ctx(db),
                     episode_id=_EPISODE_ID,
@@ -203,24 +194,12 @@ class TestEmbedEpisode:
                 )
 
     @pytest.mark.asyncio
-    async def test_empty_content(self) -> None:
+    async def test_empty_content(self, embedder: AsyncMock) -> None:
         """Empty content generates embedding (still valid)."""
-        embedding = [0.1] * 768
-
         with (
             patch("workers.tasks.base.with_retry", lambda **kw: lambda f: f),
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
             patch("repositories.episode_repository.EpisodeRepository") as mock_repo_cls,
         ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
-
             episode = MagicMock()
             episode.id = _EPISODE_ID
             episode.enrichment_status = 0
@@ -240,28 +219,16 @@ class TestEmbedEpisode:
                 content="",
             )
 
-            mock_llm.embed.assert_called_once()
+            embedder.assert_awaited_once()
             mock_repo.apply_enrichment_bits.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_db_content_fetch(self) -> None:
+    async def test_db_content_fetch(self, embedder: AsyncMock) -> None:
         """When content is None, fetch from DB."""
-        embedding = [0.1] * 768
-
         with (
             patch("workers.tasks.base.with_retry", lambda **kw: lambda f: f),
-            patch("core.org_config.get_org_config") as mock_cfg,
-            patch("core.llm.resolve_backend") as mock_llm_cls,
             patch("repositories.episode_repository.EpisodeRepository") as mock_repo_cls,
         ):
-            mock_cfg.return_value = self._make_org_config()
-
-            mock_llm = AsyncMock()
-            mock_result = MagicMock()
-            mock_result.embeddings = [embedding]
-            mock_llm.embed.return_value = mock_result
-            mock_llm_cls.return_value = mock_llm
-
             episode = MagicMock()
             episode.id = _EPISODE_ID
             episode.enrichment_status = 0
@@ -282,4 +249,4 @@ class TestEmbedEpisode:
                 content=None,
             )
 
-            mock_llm.embed.assert_called_once()
+            embedder.assert_awaited_once()

@@ -6,10 +6,11 @@ backend.  Nothing is ever written to OpenBao or Redis by this service.
 
 Probe transport notes:
 
-- LLM / embeddings go through :func:`core.llm.resolve_backend` plus a
-  minimal ``chat(max_tokens=1)`` / ``embed(["ping"])`` round-trip.  All
-  provider SDKs speak async HTTP (``httpx``) under the hood — there is
-  no ``requests`` usage anywhere on this path.
+- LLM goes through :func:`core.llm.resolve_backend` plus a minimal
+  ``chat(max_tokens=1)`` round-trip.  Provider SDKs speak async HTTP
+  (``httpx``) under the hood — there is no ``requests`` usage on this path.
+- ⚠️ BREAKING: there is no embeddings probe.  Embeddings are a local ONNX
+  model with nothing to configure or connect to.
 - Graph goes through :meth:`GraphBackendDispatcher.resolve_and_create`
   followed by ``health_check()``, with a candidate-scoped client built
   from the effective (candidate → system) URL.
@@ -89,7 +90,7 @@ class OrgConfigConnectionService:
 
         Args:
             org_id: The organization UUID.
-            domain: One of ``llm``, ``embeddings``, ``graph``, ``blob``.
+            domain: One of ``llm``, ``graph``, ``blob``.
             candidate: Partial candidate config; only ``exclude_unset``
                 fields overlay the stored config.
 
@@ -159,15 +160,13 @@ class OrgConfigConnectionService:
         match domain:
             case "llm":
                 return self._probe_llm
-            case "embeddings":
-                return self._probe_embeddings
             case "graph":
                 return self._probe_graph
             case "blob":
                 return self._probe_blob
         raise ValidationError(
             f"Unknown config test domain: {domain!r}. "
-            "Expected one of: llm, embeddings, graph, blob."
+            "Expected one of: llm, graph, blob."
         )
 
     @staticmethod
@@ -233,50 +232,6 @@ class OrgConfigConnectionService:
             raise
         except Exception as exc:
             return self._failure(start, f"llm probe failed: {exc}")
-
-    async def _probe_embeddings(self, merged: OrgConfigBase) -> ProbeResult:
-        """Single-vector embed plus frozen-dimension check.
-
-        Embeds with the frozen canonical model
-        (``core.embeddings.resolve_embed_model``) and requires exactly
-        ``CANONICAL_EMBED_DIM`` dims. Dim-incompatible providers fail the
-        probe — per-org ``embedding_model``/``embedding_dim`` overrides are
-        frozen and ignored here.
-        """
-        start = time.perf_counter()
-        if not merged.embedding_backend:
-            return self._failure(
-                start, "embeddings probe failed: embedding_backend is not configured"
-            )
-        try:
-            from core.embeddings import CANONICAL_EMBED_DIM, resolve_embed_model
-            from core.llm import resolve_backend
-
-            backend = await resolve_backend(
-                provider=merged.embedding_backend,
-                org_config=merged.to_llm_config_dict(),
-                mode="embedding",
-            )
-            model = resolve_embed_model(merged.embedding_backend)
-            response = await backend.embed(["ping"], model=model, metered=False)
-            vectors = response.embeddings
-            if not vectors or not vectors[0]:
-                return self._failure(start, "embeddings probe failed: empty response")
-            dim = len(vectors[0])
-            if dim != CANONICAL_EMBED_DIM:
-                return self._failure(
-                    start,
-                    "embeddings dim mismatch: got "
-                    f"{dim}, expected canonical {CANONICAL_EMBED_DIM} "
-                    f"(model={model})",
-                )
-            return self._success(
-                start, f"embeddings ok dim={dim} model={response.model}"
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            return self._failure(start, f"embeddings probe failed: {exc}")
 
     async def _probe_graph(self, merged: OrgConfigBase) -> ProbeResult:
         """Resolve the candidate graph backend and run ``health_check()``."""

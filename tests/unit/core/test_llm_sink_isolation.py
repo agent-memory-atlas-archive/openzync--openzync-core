@@ -23,7 +23,6 @@ import pytest
 
 from core.llm import (
     ChatResponse,
-    EmbeddingResponse,
     LLMBackend,
     TokenUsage,
     UsageRecord,
@@ -43,10 +42,6 @@ class _StubBackend(LLMBackend):
     def model_name(self) -> str:
         return "stub-model"
 
-    @property
-    def embedding_dim(self) -> int:
-        return 3
-
     async def _chat(
         self,
         messages: list[dict],
@@ -57,14 +52,6 @@ class _StubBackend(LLMBackend):
             content="hi",
             model=self.model_name,
             usage=TokenUsage(prompt_tokens=5, completion_tokens=7),
-        )
-
-    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
-        return EmbeddingResponse(
-            embeddings=[[0.1, 0.2, 0.3] for _ in texts],
-            model="stub-embed",
-            dim=3,
-            usage=TokenUsage(prompt_tokens=4),
         )
 
 
@@ -86,11 +73,6 @@ class TestSinkIsolation:
         assert isinstance(resp, ChatResponse)
         assert resp.content == "hi"
 
-    async def test_embed_sink_failure_swallowed(self) -> None:
-        resp = await _StubBackend().embed(["hello"], metered=True, sink=_failing_sink)
-        assert isinstance(resp, EmbeddingResponse)
-        assert resp.count == 1
-
     async def test_chat_cancelled_error_propagates(self) -> None:
         with pytest.raises(asyncio.CancelledError):
             await _StubBackend().chat(
@@ -98,10 +80,6 @@ class TestSinkIsolation:
                 metered=True,
                 sink=_cancelled_sink,
             )
-
-    async def test_embed_cancelled_error_propagates(self) -> None:
-        with pytest.raises(asyncio.CancelledError):
-            await _StubBackend().embed(["hello"], metered=True, sink=_cancelled_sink)
 
     async def test_metered_false_emits_nothing(self) -> None:
         seen: list[UsageRecord] = []
@@ -115,7 +93,6 @@ class TestSinkIsolation:
             metered=False,
             sink=_recording_sink,
         )
-        await backend.embed(["hello"], metered=False, sink=_recording_sink)
         assert seen == []
 
 

@@ -153,7 +153,7 @@ async def get_org_config(
             org_config = OrgConfigBase(**raw)
         except PydanticValidationError as exc:
             # Stored config predates a stricter constraint (e.g. an
-            # embedding_backend outside the known provider set).  Surface
+            # ``llm_backend`` outside the known provider set).  Surface
             # a named 422 identifying the field — never a bare-500
             # pydantic error and never secret values.
             fields = _invalid_field_names(exc)

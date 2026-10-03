@@ -257,9 +257,15 @@ def _last_validation_error(content: str, model: type[BaseModel]) -> str:
 class LLMBackend(ABC):
     """Abstract base class for all LLM providers.
 
-    Subclasses implement ``_chat`` and ``embed`` using the provider's SDK or
-    HTTP API.  Every backend reports which model it is using and the embedding
-    dimensionality.
+    Subclasses implement ``_chat`` using the provider's SDK or HTTP API.
+    Every backend reports which model it is using.
+
+    ⚠️ BREAKING: the embed capability was removed from this hierarchy.  Every
+    ``_embed`` implementation and the abstract ``embedding_dim`` are gone —
+    embeddings are produced solely by ``core.embeddings`` (``embed_passage`` /
+    ``embed_query``, a local ONNX model).  ``EmbeddingResponse`` and the
+    ``embed_count``/``embed_dim`` metering fields survive only for the
+    ``_maybe_emit_usage`` signature and are no longer written by any caller.
 
     The public ``chat`` method adds optional structured-output validation:
     when a ``response_model`` is provided, the method auto-injects a system
@@ -573,48 +579,6 @@ class LLMBackend(ABC):
 
     # ── Abstract members ───────────────────────────────────────────────────────
 
-    # ⚠️ BREAKING: backends now implement ``_embed``; the public ``embed``
-    # below adds metering (sink + timing) around it.
-    async def embed(
-        self,
-        texts: list[str],
-        sink: UsageSink | None = None,
-        metered: bool = False,
-        **kwargs: Any,
-    ) -> EmbeddingResponse:
-        """Generate embeddings for one or more text strings.
-
-        Args:
-            texts: List of input strings to embed.
-            sink: Optional metering sink (falls back to the instance sink).
-            metered: Only when ``True`` is a usage record emitted.
-                Connection pings pass ``False`` to stay out of metering.
-            **kwargs: Additional provider-specific parameters.
-
-        Returns:
-            An ``EmbeddingResponse`` containing the embedding vectors.
-        """
-        start = time.monotonic()
-        response = await self._embed(texts, **kwargs)
-        await self._maybe_emit_usage(
-            sink,
-            metered,
-            response,
-            start,
-            embed_count=len(texts),
-            embed_dim=response.dim,
-        )
-        return response
-
-    @abstractmethod
-    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
-        """Provider-specific embedding implementation.
-
-        Override this in each backend.  The public :meth:`embed` wraps
-        this with metering logic.
-        """
-        ...
-
     @property
     @abstractmethod
     def provider_name(self) -> str:
@@ -625,15 +589,6 @@ class LLMBackend(ABC):
     @abstractmethod
     def model_name(self) -> str:
         """The model identifier currently in use (e.g. ``"gpt-4o"``)."""
-        ...
-
-    @property
-    @abstractmethod
-    def embedding_dim(self) -> int:
-        """Dimensionality of the embedding vectors produced by this backend.
-
-        Returns 0 if the backend does not support embeddings.
-        """
         ...
 
 
@@ -722,7 +677,7 @@ from core.exceptions import LLMConfigurationError as LLMConfigurationError
 #: Caller context for :func:`resolve_backend` — selects which base URL /
 #: credential pair the ``openai_like`` provider uses.  All other providers
 #: ignore it.
-BackendMode = Literal["llm", "embedding"]
+BackendMode = Literal["llm"]
 
 
 async def resolve_backend(
@@ -744,16 +699,13 @@ async def resolve_backend(
         org_config: Optional dict with per-organisation LLM settings.
             Supported keys: ``llm_backend``, ``ollama_base_url``,
             ``openai_api_key``, ``openai_model``, ``openai_like_base_url``,
-            ``embedding_api_key``, ``embedding_openai_like_base_url``,
             ``llm_model``, ``azure_endpoint``,
             ``azure_api_key``, ``azure_deployment``, ``anthropic_api_key``,
             ``anthropic_model``.
-        mode: Caller context.  ``"embedding"`` selects the dedicated
-            embedding endpoint/credentials for ``openai_like``
-            (``embedding_openai_like_base_url`` + ``embedding_api_key``,
-            strict — no fallback to the LLM keys).  ``"llm"`` or ``None``
-            keeps the chat behaviour (``openai_like_base_url`` +
-            ``openai_api_key`` + ``llm_model``).
+        mode: Caller context.  Only ``"llm"`` or ``None`` remains —
+            ⚠️ BREAKING: ``"embedding"`` was removed with the per-provider
+            embedder; embeddings are now ``core.embeddings.embed_passage`` /
+            ``embed_query``.
         sink: Optional metering sink attached to the returned instance.
             Build it with :func:`services.usage_service.make_sink`.  Calls
             only emit when invoked with ``metered=True``.
@@ -766,23 +718,6 @@ async def resolve_backend(
             resolved provider name is unknown.
     """
     provider_name: str | None = None
-
-    # 0. Embedding callers resolve from ``embedding_backend`` first — never
-    #    fall through to the ``llm_backend`` path below.
-    if mode == "embedding" and provider is None:
-        if org_config and org_config.get("embedding_backend"):
-            embedding_provider: str = org_config["embedding_backend"]
-            logger.debug(
-                "llm.resolved_from_org_config",
-                extra={"provider": embedding_provider},
-            )
-            return await _create_backend(
-                embedding_provider, org_config, mode=mode, sink=sink
-            )
-        raise LLMConfigurationError(
-            "No embedding backend configured.  Set "
-            "embedding_backend in the per-org configuration."
-        )
 
     # 1. Org-level config (skip if explicit provider given).
     if provider is None and org_config and org_config.get("llm_backend"):
@@ -827,11 +762,8 @@ async def _create_backend(
             ``"azure"``, ``"anthropic"``.
         config: Optional dict with provider-specific overrides (API keys,
             model names, endpoints).  Required fields vary by provider.
-        mode: Caller context.  Only ``openai_like`` + ``"embedding"``
-            changes behaviour — it requires ``embedding_openai_like_base_url``
-            and reads ``embedding_api_key`` (``None`` allowed → the backend
-            uses its ``"not-needed"`` placeholder).  All other
-            provider/mode combinations behave as before.
+        mode: Caller context.  Accepted and ignored — no provider/mode
+            combination changes behaviour any more.
         sink: Optional metering sink attached to the created instance.
 
     Returns:
@@ -863,35 +795,16 @@ async def _create_backend(
         model: str | None = config.get("openai_model")
         instance = backend_cls(api_key=api_key, model=model)
     elif provider == "openai_like":
-        if mode == "embedding":
-            if config is None or not config.get("embedding_openai_like_base_url"):
-                raise LLMConfigurationError(
-                    "OpenAI-like embedding backend requires "
-                    "embedding_openai_like_base_url in per-org "
-                    "configuration.  Set it via PATCH /admin/org/config."
-                )
-            # Frozen contract: per-org ``embedding_model`` is rejected at the
-            # schema layer and never forwarded, so there is nothing to read
-            # from *config* here.  Resolve the model from the canonical
-            # policy instead; workers also pass it per ``embed()`` call.
-            from core.embeddings import resolve_embed_model
-
-            instance = backend_cls(
-                base_url=config["embedding_openai_like_base_url"],
-                api_key=config.get("embedding_api_key"),
-                model=resolve_embed_model(provider),
+        if config is None or not config.get("openai_like_base_url"):
+            raise LLMConfigurationError(
+                "OpenAI-like backend requires openai_like_base_url in per-org "
+                "configuration.  Set it via PATCH /admin/org/config."
             )
-        else:
-            if config is None or not config.get("openai_like_base_url"):
-                raise LLMConfigurationError(
-                    "OpenAI-like backend requires openai_like_base_url in per-org "
-                    "configuration.  Set it via PATCH /admin/org/config."
-                )
-            instance = backend_cls(
-                base_url=config["openai_like_base_url"],
-                api_key=config.get("openai_api_key"),
-                model=config.get("llm_model"),
-            )
+        instance = backend_cls(
+            base_url=config["openai_like_base_url"],
+            api_key=config.get("openai_api_key"),
+            model=config.get("llm_model"),
+        )
     elif provider == "azure":
         if config is None or not config.get("azure_endpoint"):
             raise LLMConfigurationError(
@@ -925,8 +838,8 @@ async def _create_backend(
     else:
         # ⚠️ Named error (not bare ValueError): unknown providers must
         # surface as a structured problem response, never a plain-500.
-        # Unreachable from org-config flows — the EmbeddingBackend/LlmBackend
-        # Literals reject unknown values at write (422) and read (named 422).
+        # Unreachable from org-config flows — the LlmBackend Literal rejects
+        # unknown values at write (422) and read (named 422).
         raise LLMConfigurationError(
             f"Unknown provider: {provider}. Expected one of: ollama, openai, "
             "openai_like, azure, anthropic."

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from core.llm_backends import _parse_embed_usage, _parse_openai_usage
+from core.llm_backends import _parse_openai_usage
 
 pytestmark = pytest.mark.unit
 
@@ -116,26 +116,3 @@ class TestOllamaParsing:
             )
         assert resp.content == "hi"
         assert (resp.usage.prompt_tokens, resp.usage.completion_tokens) == (0, 0)
-
-
-class TestEmbedUsage:
-    async def test_openai_style_embed_carries_usage(self) -> None:
-        from core.llm_backends import OpenAIBackend
-
-        item = MagicMock()
-        item.embedding = [0.1, 0.2, 0.3]
-        sdk_response = MagicMock()
-        sdk_response.data = [item, item]
-        sdk_response.usage = SimpleNamespace(prompt_tokens=9)
-        client = AsyncMock()
-        client.embeddings.create = AsyncMock(return_value=sdk_response)
-        with patch("openai.AsyncOpenAI", return_value=client):
-            backend = OpenAIBackend(api_key="test-key")
-
-        resp = await backend._embed(["a", "b"])
-        assert resp.count == 2
-        assert resp.dim == 3
-        assert resp.usage.prompt_tokens == 9
-
-    def test_embed_without_usage_reads_zero(self) -> None:
-        assert _parse_embed_usage(MagicMock(spec=[])).prompt_tokens == 0
