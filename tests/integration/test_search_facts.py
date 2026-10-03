@@ -18,7 +18,6 @@ Auth strategy:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -56,7 +55,6 @@ async def _wire_graph_backend(isolated_app: Any) -> Any:
     return isolated_app
 
 
-@dataclass
 async def _fake_embed(texts: list[str]) -> list[list[float]]:
     """Return one 768-dim zero vector per text.
 

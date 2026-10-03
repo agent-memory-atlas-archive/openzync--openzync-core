@@ -803,6 +803,7 @@ class TestMain:
                 await main()
 
             assert _mocks["create_arq_worker"].call_count == 2
+            _mocks["prewarm_embeddings"].assert_awaited_once()
         finally:
             _unpatch_main_deps(_mocks)
 
@@ -1093,6 +1094,17 @@ def _patch_main_deps() -> dict:
     mocks["_cdb_get_async_session_orig"] = _cdb_get_async_session_orig
     mocks["_cgb_init_dispatcher_orig"] = _cgb_init_dispatcher_orig
     mocks["_csp_surreal_pool_orig"] = _csp_surreal_pool_orig
+
+    # ── prewarm_embeddings (lazy import from core.embeddings in main()) ─
+    # Source-module target so the ``from core.embeddings import
+    # prewarm_embeddings`` inside ``main()`` resolves to the mock.
+    # CI unit env lacks fastembed — without this the real prewarm raises
+    # ImportError and all 7 TestMain tests fail.
+    _prewarm = AsyncMock()
+    prewarm_patch = patch("core.embeddings.prewarm_embeddings", new=_prewarm)
+    prewarm_patch.start()
+    _patchers.append(prewarm_patch)
+    mocks["prewarm_embeddings"] = _prewarm
 
     # ── FalkorDB / BlockingConnectionPool — lazy import in try/except ────
     # falkordb IS installed in the test env, so the lazy import succeeds
