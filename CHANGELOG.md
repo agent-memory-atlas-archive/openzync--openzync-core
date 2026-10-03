@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 <!-- towncrier release notes start -->
 
+## [1.0.0rc4] - 2026-10-03
+
+### Breaking Changes
+
+- Replace provider-routed embeddings with a single frozen ONNX embedder (`nomic-ai/nomic-embed-text-v1.5`, canonical `VECTOR(768)`): per-org `embedding_*` overrides are removed, dead `OZ_EMBEDDING_BACKEND`/`MODEL`/`DIM` env vars and Helm `embedding.*` keys are deleted (BREAKING cleanup), and the `/ready` payload gains an `embeddings` readiness check. (+onnx-embedder-freeze)
+### Changed
+
+- Bake embedding model weights into the api+worker images (no HuggingFace download at runtime); prewarm the embedder at boot with `/ready` gated until loaded. Worker resource limits set to 1 CPU/2G, Helm `pullPolicy` set to Always, and pins added for `fastembed==0.8.1`/`onnxruntime==1.30.0`/`numpy==2.2.6`. (+onnx-weights-baked)
 ## [1.0.0rc3] - 2026-09-30
 
 ### Breaking Changes
