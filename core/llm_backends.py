@@ -24,7 +24,6 @@ import httpx
 from core.exceptions import ExternalServiceError
 from core.llm import (
     ChatResponse,
-    EmbeddingResponse,
     LLMBackend,
     LLMBackendRegistry,
     PromptCachingConfig,
@@ -64,12 +63,6 @@ def _parse_openai_usage(usage_data: Any) -> TokenUsage:
     )
 
 
-def _parse_embed_usage(response: Any) -> TokenUsage:
-    """Read embedding prompt tokens from a provider response, best-effort."""
-    usage = getattr(response, "usage", None)
-    return TokenUsage(prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Ollama
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -81,14 +74,11 @@ class OllamaBackend(LLMBackend):
     Requires no API key.  Connects to the Ollama REST API at the configured
     base URL (default ``http://localhost:11434``).
 
-    Default models:
-        Chat: ``llama3.2:3b``
-        Embeddings: ``nomic-embed-text`` (768 dimensions)
+    Default chat model: ``llama3.2:3b``.  Embeddings are not served by any
+    LLM backend — they come from ``core.embeddings`` (local ONNX model).
     """
 
     DEFAULT_CHAT_MODEL: ClassVar[str] = "llama3.2:3b"
-    DEFAULT_EMBED_MODEL: ClassVar[str] = "nomic-embed-text"
-    DEFAULT_EMBED_DIM: ClassVar[int] = 768
 
     def __init__(
         self, base_url: str = "http://localhost:11434", model: str | None = None
@@ -103,7 +93,6 @@ class OllamaBackend(LLMBackend):
         self._base_url = base_url.rstrip("/")
         # Model defaults are class constants — no env-var fallback.
         self._chat_model = model or self.DEFAULT_CHAT_MODEL
-        self._embed_model = self.DEFAULT_EMBED_MODEL
 
     # ── LLMBackend ─────────────────────────────────────────────────────────
 
@@ -115,10 +104,6 @@ class OllamaBackend(LLMBackend):
     def provider_name(self) -> str:
         """Return the registry key for this backend."""
         return "ollama"
-
-    @property
-    def embedding_dim(self) -> int:
-        return self.DEFAULT_EMBED_DIM
 
     async def _chat(
         self,
@@ -220,74 +205,6 @@ class OllamaBackend(LLMBackend):
             content=content, model=data.get("model", model), usage=usage
         )
 
-    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
-        """Generate embeddings via Ollama's ``/api/embeddings`` endpoint.
-
-        Supported kwargs:
-            ``model`` — override the embedding model.
-        """
-        model = kwargs.pop("model", self._embed_model)
-        payload = {
-            "model": model,
-            "prompt": texts[0] if len(texts) == 1 else texts,
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    f"{self._base_url}/api/embeddings", json=payload
-                )
-                resp.raise_for_status()
-                data = resp.json()
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                "ollama.embed_http_error",
-                extra={
-                    "status_code": exc.response.status_code,
-                    "model": model,
-                },
-            )
-            raise
-        except httpx.TimeoutException:
-            logger.error("ollama.embed_timeout", extra={"model": model})
-            raise
-
-        # Handle both /api/embeddings (singular) and /api/embed (plural) response formats
-        raw = data.get("embeddings") or data.get("embedding")
-        if raw and isinstance(raw, list):
-            if raw and isinstance(raw[0], float):
-                # /api/embeddings returns a single embedding vector
-                embeddings = [raw]
-            else:
-                # /api/embed returns a list of embedding vectors
-                embeddings = raw
-        else:
-            embeddings = []
-        if not embeddings:
-            raise ValueError(
-                f"Empty embedding response for model {model}. Response: {str(data)[:200]}"
-            )
-        dim = len(embeddings[0])
-
-        logger.info(
-            "llm.embed_completed",
-            extra={
-                "provider": "ollama",
-                "model": model,
-                "num_texts": len(texts),
-                "dim": dim,
-            },
-        )
-
-        logger.debug("ollama.embed_metrics_missing", extra={"model": model})
-
-        return EmbeddingResponse(
-            embeddings=embeddings,
-            model=data.get("model", model),
-            dim=dim,
-            usage=TokenUsage(),
-        )
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OpenAI
@@ -304,8 +221,6 @@ class OpenAIBackend(LLMBackend):
     """
 
     DEFAULT_MODEL: ClassVar[str] = "gpt-4o-mini"
-    DEFAULT_EMBED_MODEL: ClassVar[str] = "text-embedding-3-small"
-    DEFAULT_EMBED_DIM: ClassVar[int] = 1536
     MAX_RETRIES: ClassVar[int] = 3
 
     def __init__(self, api_key: str, model: str | None = None) -> None:
@@ -316,7 +231,6 @@ class OpenAIBackend(LLMBackend):
 
         self._client = AsyncOpenAI(api_key=api_key)
         self._chat_model: str = model or self.DEFAULT_MODEL
-        self._embed_model: str = self.DEFAULT_EMBED_MODEL
 
     # ── LLMBackend ─────────────────────────────────────────────────────────
 
@@ -328,10 +242,6 @@ class OpenAIBackend(LLMBackend):
     def provider_name(self) -> str:
         """Return the registry key for this backend."""
         return "openai"
-
-    @property
-    def embedding_dim(self) -> int:
-        return self.DEFAULT_EMBED_DIM
 
     async def _chat(
         self,
@@ -450,49 +360,6 @@ class OpenAIBackend(LLMBackend):
             f"OpenAI chat failed after {self.MAX_RETRIES} retries: {last_exception}"
         ) from last_exception
 
-    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
-        """Generate embeddings via OpenAI's embeddings API.
-
-        Supported kwargs:
-            ``model`` — override the embedding model.
-        """
-        model = kwargs.pop("model", self._embed_model)
-
-        try:
-            response = await self._client.embeddings.create(
-                model=model,
-                input=texts,
-                # openai SDK v2 omits encoding_format (defaults to base64),
-                # which NVIDIA NIM rejects with 400 - request float explicitly.
-                encoding_format="float",
-            )
-        except Exception as exc:
-            logger.error(
-                "openai.embed_error",
-                extra={"error": str(exc), "model": model},
-            )
-            raise
-
-        embeddings = [item.embedding for item in response.data]
-        dim = len(embeddings[0]) if embeddings else self.DEFAULT_EMBED_DIM
-
-        logger.info(
-            "llm.embed_completed",
-            extra={
-                "provider": "openai",
-                "model": model,
-                "num_texts": len(texts),
-                "dim": dim,
-            },
-        )
-
-        return EmbeddingResponse(
-            embeddings=embeddings,
-            model=model,
-            dim=dim,
-            usage=_parse_embed_usage(response),
-        )
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Azure OpenAI
@@ -506,7 +373,6 @@ class AzureBackend(LLMBackend):
     Configured via endpoint URL, API key, and deployment name.
     """
 
-    DEFAULT_EMBED_DIM: ClassVar[int] = 1536
     MAX_RETRIES: ClassVar[int] = 3
 
     def __init__(
@@ -530,7 +396,6 @@ class AzureBackend(LLMBackend):
             api_version="2024-08-01-preview",
         )
         self._chat_model: str = deployment
-        self._embed_model: str = deployment
 
     # ── LLMBackend ─────────────────────────────────────────────────────────
 
@@ -542,10 +407,6 @@ class AzureBackend(LLMBackend):
     def provider_name(self) -> str:
         """Return the registry key for this backend."""
         return "azure"
-
-    @property
-    def embedding_dim(self) -> int:
-        return self.DEFAULT_EMBED_DIM
 
     async def _chat(
         self,
@@ -653,34 +514,6 @@ class AzureBackend(LLMBackend):
             f"Azure OpenAI chat failed after {self.MAX_RETRIES} retries: {last_exception}"
         ) from last_exception
 
-    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
-        """Generate embeddings via Azure OpenAI.
-
-        Supported kwargs:
-            ``model`` — override the deployment (defaults to the chat deployment).
-        """
-        deployment = kwargs.pop("model", self._embed_model)
-
-        try:
-            response = await self._client.embeddings.create(
-                model=deployment,
-                input=texts,
-                encoding_format="float",
-            )
-        except Exception as exc:
-            logger.error("azure.embed_error", extra={"error": str(exc)})
-            raise
-
-        embeddings = [item.embedding for item in response.data]
-        dim = len(embeddings[0]) if embeddings else self.DEFAULT_EMBED_DIM
-
-        return EmbeddingResponse(
-            embeddings=embeddings,
-            model=deployment,
-            dim=dim,
-            usage=_parse_embed_usage(response),
-        )
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Anthropic
@@ -691,8 +524,6 @@ class AnthropicBackend(LLMBackend):
     """LLM backend for the Anthropic API (Claude models).
 
     Uses the official ``anthropic`` library.
-    Embeddings are **not supported** — calling ``embed()`` raises
-    ``NotImplementedError``.
     """
 
     DEFAULT_MODEL: ClassVar[str] = "claude-sonnet-4-20250514"
@@ -717,10 +548,6 @@ class AnthropicBackend(LLMBackend):
     def provider_name(self) -> str:
         """Return the registry key for this backend."""
         return "anthropic"
-
-    @property
-    def embedding_dim(self) -> int:
-        return 0  # Anthropic does not offer a public embedding API.
 
     async def _chat(
         self,
@@ -847,13 +674,6 @@ class AnthropicBackend(LLMBackend):
             f"Anthropic chat failed after {self.MAX_RETRIES} retries: {last_exception}"
         ) from last_exception
 
-    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
-        """Embeddings are not supported by the Anthropic API."""
-        raise NotImplementedError(
-            "Anthropic does not offer a public embedding API. "
-            "Use a different backend (Ollama, OpenAI, or Azure) for embeddings."
-        )
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OpenAI-compatible (generic)
@@ -869,12 +689,9 @@ class OpenAILikeBackend(LLMBackend):
     ``"not-needed"`` placeholder.
 
     Handles 429 rate limits with exponential backoff (up to 3 retries).
-    Embeddings report their actual dimensionality.
     """
 
     DEFAULT_MODEL: ClassVar[str] = "gpt-4o-mini"
-    DEFAULT_EMBED_MODEL: ClassVar[str] = "text-embedding-3-small"
-    DEFAULT_EMBED_DIM: ClassVar[int] = 1536
     MAX_RETRIES: ClassVar[int] = 3
 
     def __init__(
@@ -893,8 +710,6 @@ class OpenAILikeBackend(LLMBackend):
             api_key=api_key or "not-needed",
         )
         self._chat_model: str = model or self.DEFAULT_MODEL
-        self._embed_model: str = self.DEFAULT_EMBED_MODEL
-        self._embedding_dim: int = self.DEFAULT_EMBED_DIM
 
     # ── LLMBackend ─────────────────────────────────────────────────────────
 
@@ -906,10 +721,6 @@ class OpenAILikeBackend(LLMBackend):
     def provider_name(self) -> str:
         """Return the registry key for this backend."""
         return "openai_like"
-
-    @property
-    def embedding_dim(self) -> int:
-        return self._embedding_dim
 
     async def _chat(
         self,
@@ -1029,48 +840,6 @@ class OpenAILikeBackend(LLMBackend):
         raise RuntimeError(
             f"OpenAI-like chat failed after {self.MAX_RETRIES} retries: {last_exception}"
         ) from last_exception
-
-    async def _embed(self, texts: list[str], **kwargs: Any) -> EmbeddingResponse:
-        """Generate embeddings via the OpenAI-compatible embeddings API.
-
-        Supported kwargs:
-            ``model`` — override the embedding model.
-        """
-        model = kwargs.pop("model", self._embed_model)
-
-        try:
-            response = await self._client.embeddings.create(
-                model=model,
-                input=texts,
-                encoding_format="float",
-            )
-        except Exception as exc:
-            logger.error(
-                "openai_like.embed_error",
-                extra={"error": str(exc), "model": model},
-            )
-            raise
-
-        embeddings = [item.embedding for item in response.data]
-        dim = len(embeddings[0]) if embeddings else self.DEFAULT_EMBED_DIM
-        self._embedding_dim = dim
-
-        logger.info(
-            "llm.embed_completed",
-            extra={
-                "provider": "openai_like",
-                "model": model,
-                "num_texts": len(texts),
-                "dim": dim,
-            },
-        )
-
-        return EmbeddingResponse(
-            embeddings=embeddings,
-            model=model,
-            dim=dim,
-            usage=_parse_embed_usage(response),
-        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

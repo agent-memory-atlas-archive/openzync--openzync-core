@@ -558,6 +558,16 @@ async def main() -> NoReturn:
         max_overflow=5,
     )
 
+    # ── Prewarm the frozen embedder (fail-fast) ─────────────────────────
+    # Same guarantee as the API lifespan: load the ONNX model and run one
+    # dummy inference before accepting jobs. A corrupt or missing model
+    # bake raises here and aborts boot — no try/except, loud by design —
+    # instead of failing embedding jobs at runtime.
+    from core.embeddings import prewarm_embeddings
+
+    await prewarm_embeddings()
+    logger.info("embeddings.prewarmed")
+
     # ── Start Prometheus HTTP server ────────────────────────────────────
     try:
         start_prometheus_server(settings.PROMETHEUS_PORT)

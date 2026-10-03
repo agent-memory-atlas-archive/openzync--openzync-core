@@ -19,13 +19,9 @@ logger = logging.getLogger(__name__)
 
 LlmBackend = Literal["ollama", "openai", "openai_like", "azure", "anthropic"]
 
-EmbeddingBackend = Literal["ollama", "openai", "openai_like", "azure", "anthropic"]
-"""Embedding provider — same registry as ``core.llm._create_backend``.
-
-Constrained (not free-form ``str``) so unknown values fail at write
-(422) and, for rows stored before the constraint, at read via the
-named-422 wrapper in ``core.org_config.get_org_config``.
-"""
+# ⚠️ BREAKING: ``EmbeddingBackend`` was removed. Embeddings are produced by a
+# single local ONNX model (``core.embeddings``) with no provider routing, so
+# there is nothing left for a Literal to constrain.
 
 # ── System-managed field sets ──────────────────────────────────────────────
 # These fields are overridden at the system level (via OpenBao / env vars)
@@ -150,36 +146,12 @@ class OrgConfigBase(BaseModel):
     )
 
     # ── Embeddings ─────────────────────────────────────────────────────────
-    embedding_backend: EmbeddingBackend | None = Field(
-        default=None,
-        description="Embedding provider.  Falls back to LLM_BACKEND when empty.",
-    )
-    embedding_model: str | None = Field(
-        default=None,
-        description="DEPRECATED (frozen): embedding model is fixed to the "
-        "canonical model (snowflake-arctic-embed-m-v1.5, 768 dims). "
-        "Setting this via PATCH/PUT is rejected with 400 embedding_frozen. "
-        "Read-only legacy value.",
-    )
-    embedding_dim: int | None = Field(
-        default=None,
-        ge=64,
-        le=4096,
-        description="DEPRECATED (frozen): embedding dimension is fixed to "
-        "768. Setting this via PATCH/PUT is rejected with 400 "
-        "embedding_frozen. Read-only legacy value.",
-    )
-    embedding_api_key: str | None = Field(
-        default=None,
-        description="API key for the embedding provider (optional — "
-        "endpoints without auth use a placeholder).",
-    )
-    embedding_openai_like_base_url: str | None = Field(
-        default=None,
-        description="Base URL for the embedding OpenAI-compatible endpoint. "
-        "Required when embedding_backend is openai_like; never falls back "
-        "to openai_like_base_url (LLM) and vice versa.",
-    )
+    # ⚠️ BREAKING: embedding_backend / embedding_model / embedding_dim /
+    # embedding_api_key / embedding_openai_like_base_url were removed from this
+    # model.  Embeddings are a local ONNX model with zero configuration — see
+    # ``core.embeddings``.  Stored rows carrying these keys still validate,
+    # Pydantic ignores unknown keys by default, and they are dropped on the
+    # next write.
 
     # ── Graph ──────────────────────────────────────────────────────────────
     graph_backend: str | None = Field(
@@ -372,10 +344,6 @@ class OrgConfigBase(BaseModel):
             d["openai_api_key"] = self.openai_api_key
         if self.openai_like_base_url is not None:
             d["openai_like_base_url"] = self.openai_like_base_url
-        if self.embedding_api_key is not None:
-            d["embedding_api_key"] = self.embedding_api_key
-        if self.embedding_openai_like_base_url is not None:
-            d["embedding_openai_like_base_url"] = self.embedding_openai_like_base_url
         if self.llm_model is not None:
             d["openai_model"] = self.llm_model
             d["llm_model"] = self.llm_model
@@ -398,32 +366,6 @@ class OrgConfigBase(BaseModel):
             d["prompt_caching"] = self.prompt_caching.model_dump(
                 mode="python", exclude_none=True
             )
-        return d
-
-    def to_embedding_config_dict(self) -> dict[str, str | int]:
-        """Return embedding config as a flat dict.
-
-        Only non-``None`` fields are included.  Used by worker tasks that
-        read embedding settings directly.  Frozen legacy fields
-        (``embedding_model`` / ``embedding_dim``) are passed through
-        read-only — writes are still rejected with 400
-        ``embedding_frozen`` in ``services/org_config_service.py``.
-        Callers needing a guaranteed value must read via ``.get()``
-        with the canonical model/dim from ``core.embeddings`` as default.
-        """
-        d: dict[str, str | int] = {}
-        if self.embedding_backend is not None:
-            d["embedding_backend"] = self.embedding_backend
-        # ⚠️ FROZEN READ-ONLY: passthrough for legacy readers only.
-        # Writes stay rejected in OrgConfigService — no write path here.
-        if self.embedding_model is not None:
-            d["embedding_model"] = self.embedding_model
-        if self.embedding_dim is not None:
-            d["embedding_dim"] = self.embedding_dim
-        if self.embedding_api_key is not None:
-            d["embedding_api_key"] = self.embedding_api_key
-        if self.embedding_openai_like_base_url is not None:
-            d["embedding_openai_like_base_url"] = self.embedding_openai_like_base_url
         return d
 
     def to_blob_storage_config(self) -> dict[str, Any]:
@@ -478,19 +420,8 @@ class UpdateOrgConfigRequest(BaseModel):
         "enrichment (defaults to ON when unset).",
     )
     prompt_caching: PromptCachingOrgConfig | None = None
-    embedding_backend: EmbeddingBackend | None = None
-    embedding_model: str | None = Field(
-        default=None,
-        description="DEPRECATED (frozen): rejected with 400 embedding_frozen.",
-    )
-    embedding_dim: int | None = Field(
-        default=None,
-        ge=64,
-        le=4096,
-        description="DEPRECATED (frozen): rejected with 400 embedding_frozen.",
-    )
-    embedding_api_key: str | None = None
-    embedding_openai_like_base_url: str | None = None
+    # ⚠️ BREAKING: embedding_* fields removed — see the note on
+    # ``OrgConfigBase``. Embedding settings now live in no config surface at all.
     graph_backend: str | None = Field(
         default=None,
         description="Graph backend (falkordb, surrealdb, none). "
@@ -580,8 +511,12 @@ class UpdateOrgConfigRequest(BaseModel):
         return v
 
 
-ConfigTestDomain = Literal["llm", "embeddings", "graph", "blob"]
-"""Domain selector for ``POST /admin/org/config/test``."""
+ConfigTestDomain = Literal["llm", "graph", "blob"]
+"""Domain selector for ``POST /admin/org/config/test``.
+
+⚠️ BREAKING: ``"embeddings"`` was removed — there is no embedder to
+configure or probe.  POSTing it now fails schema validation (422).
+"""
 
 
 class TestOrgConfigRequest(BaseModel):
@@ -593,7 +528,7 @@ class TestOrgConfigRequest(BaseModel):
     """
 
     domain: ConfigTestDomain = Field(
-        description="Which connection family to probe (llm, embeddings, graph, blob).",
+        description="Which connection family to probe (llm, graph, blob).",
     )
     config: UpdateOrgConfigRequest = Field(
         description="Partial candidate config overlaid on the stored "

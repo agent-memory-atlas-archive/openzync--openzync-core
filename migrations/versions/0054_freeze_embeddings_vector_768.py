@@ -5,7 +5,7 @@ Context
 Per-org configurable embedding dims forced ``float8[]``/``Text`` storage
 plus runtime ``CAST(... AS VECTOR(dim))`` (migration 0017 documents the
 abandoned ``vector(4096)`` attempt). Embeddings are now frozen to the
-canonical model (``snowflake-arctic-embed-m-v1.5``, 768 dims — see
+canonical model (``nomic-ai/nomic-embed-text-v1.5``, 768 dims — see
 ``core/embeddings.py``), so both columns become native ``VECTOR(768)``
 with HNSW cosine indexes.
 

@@ -63,6 +63,7 @@ async def test_readiness_ok() -> None:
     with (
         patch("routers.health._check_db_health", return_value=True),
         patch("routers.health._check_redis_health", return_value=True),
+        patch("routers.health.is_model_loaded", return_value=True),
     ):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.get("/ready")
@@ -72,6 +73,7 @@ async def test_readiness_ok() -> None:
     assert body["status"] == "ok"
     assert body["checks"]["database"] is True
     assert body["checks"]["redis"] is True
+    assert body["checks"]["embeddings"] is True
 
 
 @pytest.mark.asyncio
@@ -167,7 +169,7 @@ async def test_health_exact_live_contract() -> None:
 async def test_readiness_exact_live_contract() -> None:
     """GET /ready returns the exact live payload when all deps are healthy.
 
-    Live: ``200 {"status":"ok","checks":{"database":true,"redis":true}}``.
+    Live: ``200 {"status":"ok","checks":{"database":true,"redis":true,"embeddings":true}}``.
     """
     app = _create_app()
     transport = ASGITransport(app=app)
@@ -175,6 +177,7 @@ async def test_readiness_exact_live_contract() -> None:
     with (
         patch("routers.health._check_db_health", return_value=True),
         patch("routers.health._check_redis_health", return_value=True),
+        patch("routers.health.is_model_loaded", return_value=True),
     ):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.get("/ready")
@@ -182,7 +185,7 @@ async def test_readiness_exact_live_contract() -> None:
     assert resp.status_code == 200
     assert resp.json() == {
         "status": "ok",
-        "checks": {"database": True, "redis": True},
+        "checks": {"database": True, "redis": True, "embeddings": True},
     }
 
 
@@ -199,12 +202,33 @@ async def test_health_paths_live_at_root_not_v1() -> None:
     with (
         patch("routers.health._check_db_health", return_value=True),
         patch("routers.health._check_redis_health", return_value=True),
+        patch("routers.health.is_model_loaded", return_value=True),
     ):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             assert (await client.get("/health")).status_code == 200
             assert (await client.get("/ready")).status_code == 200
             assert (await client.get("/v1/health")).status_code == 404
             assert (await client.get("/v1/ready")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_readiness_degraded_embeddings() -> None:
+    """GET /ready returns 503 when the embedder prewarm has not completed."""
+    app = _create_app()
+    transport = ASGITransport(app=app)
+
+    with (
+        patch("routers.health._check_db_health", return_value=True),
+        patch("routers.health._check_redis_health", return_value=True),
+        patch("routers.health.is_model_loaded", return_value=False),
+    ):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/ready")
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert body["checks"]["embeddings"] is False
 
 
 def test_health_router_has_no_prefix() -> None:

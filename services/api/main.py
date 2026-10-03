@@ -171,6 +171,16 @@ def create_app() -> FastAPI:
             logger.exception("platform_seed.failed — aborting startup")
             raise
 
+        # ── Prewarm the frozen embedder (fail-fast) ─────────────────────
+        # DB/Redis/graph backends are up; load the ONNX model and run one
+        # dummy inference before serving traffic. A corrupt or missing
+        # model bake raises here and aborts boot — no try/except, loud by
+        # design — instead of surfacing as user-facing 503s.
+        from core.embeddings import prewarm_embeddings
+
+        await prewarm_embeddings()
+        logger.info("embeddings.prewarmed")
+
         yield
 
         # ── Shutdown (reverse order of initialisation) ────────────────────

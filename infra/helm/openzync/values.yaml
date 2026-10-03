@@ -18,7 +18,7 @@ api:
   image:
     repository: openzync-api
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   containerPort: 8000
   health:
     path: /health
@@ -52,7 +52,7 @@ worker:
   image:
     repository: openzync-worker
     tag: latest
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   health:
     initialDelaySeconds: 15
     periodSeconds: 30
@@ -114,11 +114,6 @@ config:
   llmBackend: "ollama"
   llmModel: "llama3.2:3b"
   ollamaBaseUrl: "http://ollama:11434"
-
-  # Embeddings
-  embeddingBackend: ""
-  embeddingModel: "nomic-embed-text"
-  embeddingDim: 768
 
   # Graph backend
   graphBackend: "falkordb"

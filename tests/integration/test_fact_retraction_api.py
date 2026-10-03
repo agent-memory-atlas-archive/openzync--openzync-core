@@ -35,28 +35,20 @@ async def _wire_graph_backend(isolated_app: Any) -> Any:
     return isolated_app
 
 
-class _FakeEmbedResponse:
-    """Fake embed response — mirrors the real backend's shape."""
+async def _fake_embed(texts: list[str]) -> list[list[float]]:
+    """Return one 768-dim zero vector per text.
 
-    def __init__(self, embeddings: list[list[float]] | None = None) -> None:
-        self.embeddings = embeddings
-
-
-class _FakeEmbedBackend:
-    async def embed(self, texts, model=None) -> _FakeEmbedResponse:
-        return _FakeEmbedResponse(embeddings=[[0.0] * 1536 for _ in texts])
-
-
-async def _fake_resolve_backend(
-    provider=None, org_config=None, mode=None
-) -> _FakeEmbedBackend:
-    return _FakeEmbedBackend()
+    Matches the ``vector(768)`` columns so the pgvector ``<=>`` operator
+    works, and satisfies ``validate_embedding_dim``.
+    """
+    return [[0.0] * 768 for _ in texts]
 
 
 @pytest.fixture(autouse=True)
 def _fake_embedding_backend(monkeypatch) -> None:
-    """Stub the LLM embedding backend (none configured in the test env)."""
-    monkeypatch.setattr("core.llm.resolve_backend", _fake_resolve_backend)
+    """Stub the local embedder so no ONNX model is downloaded in tests."""
+    monkeypatch.setattr("core.embeddings.embed_query", _fake_embed)
+    monkeypatch.setattr("core.embeddings.embed_passage", _fake_embed)
 
 
 def _fact_payload(

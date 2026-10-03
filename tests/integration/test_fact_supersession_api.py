@@ -63,10 +63,20 @@ async def _fake_resolve_backend(
     return _FakeEmbedBackend()
 
 
+async def _fake_embed(texts: list[str]) -> list[list[float]]:
+    """Return one 768-dim zero vector per text.
+
+    Matches the ``vector(768)`` columns so the pgvector ``<=>`` operator
+    works, and satisfies ``validate_embedding_dim``.
+    """
+    return [[0.0] * 768 for _ in texts]
+
+
 @pytest.fixture(autouse=True)
 def _fake_embedding_backend(monkeypatch) -> None:
-    """Stub the LLM embedding backend (none configured in the test env)."""
-    monkeypatch.setattr("core.llm.resolve_backend", _fake_resolve_backend)
+    """Stub the local embedder so no ONNX model is downloaded in tests."""
+    monkeypatch.setattr("core.embeddings.embed_query", _fake_embed)
+    monkeypatch.setattr("core.embeddings.embed_passage", _fake_embed)
 
 
 def _fact_payload(
@@ -116,7 +126,9 @@ class TestIngestContract:
         await _create_user(isolated_auth_client, "ss_202_user")
         resp = await isolated_auth_client.post(
             f"/v1/projects/{isolated_project_id}/facts",
-            json=_fact_payload("Alice", "likes", "hiking", session_id=isolated_fact_session),
+            json=_fact_payload(
+                "Alice", "likes", "hiking", session_id=isolated_fact_session
+            ),
         )
         assert resp.status_code == 202, (
             f"Expected 202, got {resp.status_code}: {resp.text}"
@@ -167,11 +179,17 @@ class TestIngestContract:
         and the dedup replay must NOT swallow the second batch."""
         await _create_user(isolated_auth_client, "ss_spo_user")
         first = _fact_payload(
-            "Alice", "likes", "hiking", "Alice likes hiking",
+            "Alice",
+            "likes",
+            "hiking",
+            "Alice likes hiking",
             session_id=isolated_fact_session,
         )
         second = _fact_payload(
-            "Alice", "likes", "hiking", "Alice absolutely loves hiking",
+            "Alice",
+            "likes",
+            "hiking",
+            "Alice absolutely loves hiking",
             session_id=isolated_fact_session,
         )
 
@@ -210,11 +228,17 @@ class TestFactsListTemporal:
         """Contracts 3+4+5 — as-of shows old then new; default shows new."""
         await _create_user(isolated_auth_client, "ss_list_user")
         first = _fact_payload(
-            "Alice", "likes", "hiking", "Alice likes hiking",
+            "Alice",
+            "likes",
+            "hiking",
+            "Alice likes hiking",
             session_id=isolated_fact_session,
         )
         second = _fact_payload(
-            "Alice", "likes", "hiking", "Alice loves hiking",
+            "Alice",
+            "likes",
+            "hiking",
+            "Alice loves hiking",
             session_id=isolated_fact_session,
         )
 
@@ -306,11 +330,17 @@ class TestContextAsOf:
     ) -> None:
         await _create_user(isolated_auth_client, "ss_ctx_user")
         first = _fact_payload(
-            "Alice", "likes", "hiking", "Alice likes hiking",
+            "Alice",
+            "likes",
+            "hiking",
+            "Alice likes hiking",
             session_id=isolated_fact_session,
         )
         second = _fact_payload(
-            "Alice", "likes", "hiking", "Alice loves hiking",
+            "Alice",
+            "likes",
+            "hiking",
+            "Alice loves hiking",
             session_id=isolated_fact_session,
         )
 

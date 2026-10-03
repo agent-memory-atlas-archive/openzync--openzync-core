@@ -372,18 +372,23 @@ class HybridRetriever:
     # ── Vector Search ──────────────────────────────────────────────────────────
 
     async def _embed_query(
-        self, query: str, project_id: UUID | None = None
+        self,
+        query: str,
+        project_id: UUID | None = None,  # noqa: ARG002
     ) -> list[float]:
         """Generate an embedding vector for a search query.
 
-        Embeds with the frozen canonical model
-        (``core.embeddings.resolve_embed_model``) and rejects any vector
-        that is not exactly ``CANONICAL_EMBED_DIM`` — fail loud, never
-        search with a wrong-dim vector.
+        Embeds with the single local embedder
+        (``core.embeddings.embed_query``) — the *query* prefix, not
+        ``embed_passage``. The two are not interchangeable: ``nomic-embed-
+        text-v1.5`` is trained with asymmetric search/document prefixes and
+        mixing them degrades recall silently (still 768 valid floats).
+        Rejects any vector that is not exactly ``CANONICAL_EMBED_DIM`` —
+        fail loud, never search with a wrong-dim vector.
 
         Args:
             query: Natural-language query text.
-            project_id: Project scope recorded on the metering row.
+            project_id: Unused; retained for call-site compatibility.
 
         Returns:
             A list of floats representing the query embedding.
@@ -393,36 +398,11 @@ class HybridRetriever:
                 no embeddings, or returns a non-canonical-dim vector.
         """
         try:
-            from core.embeddings import (
-                resolve_embed_model,
-                validate_embedding_dim,
-            )
-            from core.llm import resolve_backend
-            from services.usage_service import make_sink
+            from core.embeddings import embed_query, validate_embedding_dim
 
-            org_config_dict = (
-                self._org_config.to_llm_config_dict() if self._org_config else None
-            )
-            sink = make_sink(
-                self._db,
-                org_id=self._org_id,
-                worker="query_embed",
-                project_id=project_id,
-            )
-            backend = await resolve_backend(
-                provider=self._org_config.embedding_backend
-                if self._org_config
-                else None,
-                org_config=org_config_dict,
-                mode="embedding",
-                sink=sink,
-            )
-            model = resolve_embed_model(
-                self._org_config.embedding_backend if self._org_config else None
-            )
-            response = await backend.embed([query], model=model, metered=True)
-            if response.embeddings and len(response.embeddings) > 0:
-                query_embedding = response.embeddings[0]
+            vectors = await embed_query([query])
+            if vectors:
+                query_embedding = vectors[0]
                 validate_embedding_dim(
                     query_embedding, source="hybrid_retriever._embed_query"
                 )

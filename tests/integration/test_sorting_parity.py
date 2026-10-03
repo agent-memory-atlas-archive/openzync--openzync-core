@@ -777,30 +777,16 @@ async def _wire_graph_backend(isolated_app: Any) -> Any:
     return isolated_app
 
 
+async def _fake_embed(texts: list[str]) -> list[list[float]]:
+    """Neutralise the vector leg with 768-dim zero vectors."""
+    return [[0.0] * 768 for _ in texts]
+
+
 @pytest.fixture(autouse=True)
 def _fake_embedding_backend(monkeypatch: Any) -> None:
-    """Neutralise the vector leg (768-dim zero vectors)."""
-    from dataclasses import dataclass
-
-    @dataclass
-    class _Resp:
-        embeddings: list[list[float]] | None = None
-
-    class _Backend:
-        async def embed(
-            self, texts: Any, model: Any = None, metered: bool = True
-        ) -> _Resp:
-            return _Resp(embeddings=[[0.0] * 768 for _ in texts])
-
-    async def _resolve(
-        provider: Any = None,
-        org_config: Any = None,
-        mode: Any = None,
-        sink: Any = None,
-    ) -> _Backend:
-        return _Backend()
-
-    monkeypatch.setattr("core.llm.resolve_backend", _resolve)
+    """Stub the local embedder for the vector search leg."""
+    monkeypatch.setattr("core.embeddings.embed_query", _fake_embed)
+    monkeypatch.setattr("core.embeddings.embed_passage", _fake_embed)
 
 
 class TestSearchParity:

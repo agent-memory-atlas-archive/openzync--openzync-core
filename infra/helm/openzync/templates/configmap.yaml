@@ -9,9 +9,6 @@ data:
   OZ_LOG_LEVEL: {{ .Values.global.logLevel | quote }}
   OZ_LLM_BACKEND: {{ .Values.config.llmBackend | quote }}
   OZ_LLM_MODEL: {{ .Values.config.llmModel | quote }}
-  OZ_EMBEDDING_BACKEND: {{ .Values.config.embeddingBackend | quote }}
-  OZ_EMBEDDING_MODEL: {{ .Values.config.embeddingModel | quote }}
-  OZ_EMBEDDING_DIM: {{ .Values.config.embeddingDim | quote }}
   OZ_GRAPH_BACKEND: {{ .Values.config.graphBackend | quote }}
   OZ_GRAPH_MAX_TRAVERSAL_DEPTH: {{ .Values.config.graphMaxTraversalDepth | quote }}
   OZ_CONTEXT_CACHE_TTL: {{ .Values.config.contextCacheTtl | quote }}

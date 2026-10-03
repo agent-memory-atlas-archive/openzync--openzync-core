@@ -19,7 +19,7 @@ leaves episodes un-enriched until an operator manually intervenes.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import structlog
 
@@ -32,9 +32,6 @@ from workers.tasks.base import (
     ENRICHMENT_STRUCTURED_EXTRACTION,
     LLM_INVALIDATION_BIT,
 )
-
-if TYPE_CHECKING:
-    from schemas.organization_config import OrgConfigBase
 
 # Combined LLM enrichment bits — one task replaces 4 individual LLM calls
 # (plus the LLM-driven invalidation pass inside the same facts savepoint).
@@ -75,8 +72,13 @@ _NON_LLM_TASK_MAP: dict[int, tuple[str, set[str], str]] = {
     ENRICHMENT_ENTITY_LINKS: (
         "link_entities_to_episode",
         {
-            "episode_id", "org_id", "project_id",
-            "content", "role", "trace_id", "metadata",
+            "episode_id",
+            "org_id",
+            "project_id",
+            "content",
+            "role",
+            "trace_id",
+            "metadata",
         },
         "low",
     ),
@@ -86,70 +88,20 @@ _NON_LLM_TASK_MAP: dict[int, tuple[str, set[str], str]] = {
 _LLM_TASK_DETAILS: tuple[str, set[str], str] = (
     "enrich_episode",
     {
-        "episode_id", "org_id", "project_id", "content",
-        "session_id", "trace_id", "metadata", "role",
+        "episode_id",
+        "org_id",
+        "project_id",
+        "content",
+        "session_id",
+        "trace_id",
+        "metadata",
+        "role",
     },
     "high",
 )
 
 
-async def _resolve_fact_org_config(
-    ctx: dict[str, Any],
-    org_id: str,
-) -> OrgConfigBase | None:
-    """Resolve the per-org config for the fact-embedding repair pass.
-
-    Mirrors the org-config resolution pattern used by the worker tasks
-    (``ctx["openbao_client"]`` when present, otherwise a short-lived client
-    from bootstrap settings) and reuses the shared Redis cache via
-    ``core.org_config.get_org_config``.  Returns ``None`` when the config
-    cannot be fetched so the caller skips the org this tick — the facts stay
-    eligible and are retried on the next run.
-
-    Args:
-        ctx: ARQ worker context dict (may contain ``openbao_client``/``redis``).
-        org_id: The organization UUID as a string.
-
-    Returns:
-        An ``OrgConfigBase`` or ``None`` when resolution failed.
-    """
-    import uuid
-
-    from core.config import BootstrapSettings
-    from core.openbao import OpenBaoClient
-    from core.org_config import get_org_config
-
-    bao_client = ctx.get("openbao_client")
-    try:
-        if bao_client is not None:
-            return await get_org_config(
-                uuid.UUID(org_id),
-                redis=ctx.get("redis"),
-                bao_client=bao_client,
-            )
-        bootstrap = BootstrapSettings()
-        async with OpenBaoClient(
-            bootstrap.OPENBAO_ADDR,
-            bootstrap.OPENBAO_ROLE_ID,
-            bootstrap.OPENBAO_SECRET_ID,
-            timeout=10.0,
-        ) as tmp_bao:
-            return await get_org_config(
-                uuid.UUID(org_id),
-                redis=ctx.get("redis"),
-                bao_client=tmp_bao,
-            )
-    except Exception:
-        logger.warning(
-            "reconcile_enrichment.fact_org_config_fetch_failed",
-            org_id=org_id,
-            exc_info=True,
-        )
-        return None
-
-
 async def _repair_missing_fact_embeddings(
-    ctx: dict[str, Any],
     session_factory: Any,
     arq_redis: Any,
     high_queue_name: str,
@@ -160,12 +112,10 @@ async def _repair_missing_fact_embeddings(
     eligible for repair only when never attempted (``embedding IS NULL AND
     embedded_at IS NULL``) and not retracted (``invalid_at IS NULL``).  Facts
     retired by ``embed_fact`` (permanent 4xx) have ``embedded_at`` set
-    and are excluded.  Orgs without ``embedding_backend``
-    configured are skipped so a misconfigured org does not churn the queue
-    every tick.
+    and are excluded.  The embedder is a local ONNX model with no
+    per-org configuration, so there is no misconfigured-org case to skip.
 
     Args:
-        ctx: ARQ worker context dict used for org-config resolution.
         session_factory: ARQ ctx async session factory.
         arq_redis: ARQ Redis client used to enqueue jobs.
         high_queue_name: Name of the high-priority queue.
@@ -203,12 +153,14 @@ async def _repair_missing_fact_embeddings(
             .limit(RECONCILE_BATCH_SIZE)
         )
         for row in result.all():
-            rows.append({
-                "id": str(row.id),
-                "content": row.content,
-                "org_id": str(row.organization_id),
-                "project_id": str(row.project_id),
-            })
+            rows.append(
+                {
+                    "id": str(row.id),
+                    "content": row.content,
+                    "org_id": str(row.organization_id),
+                    "project_id": str(row.project_id),
+                }
+            )
 
     if not rows:
         return 0
@@ -225,15 +177,6 @@ async def _repair_missing_fact_embeddings(
 
     enqueued: int = 0
     for org_id, org_facts in by_org.items():
-        org_cfg = await _resolve_fact_org_config(ctx, org_id)
-        if org_cfg is None or org_cfg.embedding_backend is None:
-            logger.info(
-                "reconcile_enrichment.fact_embedding_skipped_misconfigured",
-                org_id=org_id,
-                facts=len(org_facts),
-            )
-            continue
-
         for fact_row in org_facts:
             task_kwargs = {
                 "fact_id": fact_row["id"],
@@ -323,14 +266,13 @@ async def reconcile_enrichment(ctx: dict[str, Any]) -> str:
     # Separate from the episode pass below — facts with a NULL embedding
     # cannot be expressed as an episode enrichment bit.
     fact_embedding_enqueued = await _repair_missing_fact_embeddings(
-        ctx,
         session_factory,
         arq_redis,
         high_queue_name,
     )
 
     # ── Query stale episodes ─────────────────────────────────────────────
-    from sqlalchemy import select, text
+    from sqlalchemy import or_, select, text
 
     from models.episode import Episode
     from models.project import Project
@@ -352,9 +294,18 @@ async def reconcile_enrichment(ctx: dict[str, Any]) -> str:
                 Episode.session_id,
                 Episode.metadata_,
                 Episode.enrichment_status,
-            ).where(
-                (Episode.enrichment_status.op("&")(LLM_ENRICHMENT_BITS))
-                != LLM_ENRICHMENT_BITS,
+            )
+            .where(
+                # ⚠️ The EMBEDDING bit is an OR-arm, not part of the mask
+                # below: an episode can be fully LLM-enriched and still
+                # need re-embedding (a same-dimension model swap clears
+                # only this bit — see scripts/reset_embeddings_for_remodel.py).
+                # Matching on the LLM mask alone would never select it.
+                or_(
+                    (Episode.enrichment_status.op("&")(LLM_ENRICHMENT_BITS))
+                    != LLM_ENRICHMENT_BITS,
+                    Episode.enrichment_status.op("&")(ENRICHMENT_EMBEDDING) == 0,
+                ),
                 Episode.is_deleted.is_(False),
                 Episode.updated_at < cutoff,
                 Episode.project_id.not_in(
@@ -367,15 +318,17 @@ async def reconcile_enrichment(ctx: dict[str, Any]) -> str:
         rows = result.all()
 
         for row in rows:
-            stale_episodes.append({
-                "id": str(row.id),
-                "content": row.content,
-                "org_id": str(row.organization_id),
-                "project_id": str(row.project_id),
-                "session_id": str(row.session_id),
-                "metadata": row.metadata_,
-                "enrichment_status": row.enrichment_status,
-            })
+            stale_episodes.append(
+                {
+                    "id": str(row.id),
+                    "content": row.content,
+                    "org_id": str(row.organization_id),
+                    "project_id": str(row.project_id),
+                    "session_id": str(row.session_id),
+                    "metadata": row.metadata_,
+                    "enrichment_status": row.enrichment_status,
+                }
+            )
 
     if not stale_episodes:
         logger.debug("reconcile_enrichment.nothing_stale")

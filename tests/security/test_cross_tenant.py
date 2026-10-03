@@ -45,7 +45,6 @@ runs — and it never discloses whether the foreign project exists.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -124,29 +123,20 @@ async def _create_session(
 # ── Search fixtures (mirror tests/integration/test_search_facts.py) ───────
 # ``isolated_app`` does not run the lifespan, so the graph-backend
 # dispatcher must be wired manually; the vector leg needs a stubbed
-# embedding backend. The stub must return canonical-dim vectors — prod
+# embedder. The stub must return canonical-dim vectors — prod
 # ``validate_embedding_dim`` (core/embeddings.py) hard-rejects any other
 # length, so a stale literal here surfaces as a 503 ``search_leg_failed``.
 
 
-@dataclass
-class _FakeEmbedResponse:
-    embeddings: list[list[float]] | None = None
+async def _fake_embed(texts: list[str]) -> list[list[float]]:
+    """Return one canonical-dim zero vector per text."""
+    return [[0.0] * CANONICAL_EMBED_DIM for _ in texts]
 
 
-class _FakeEmbedBackend:
-    async def embed(
-        self, texts: list[str], model: str | None = None
-    ) -> _FakeEmbedResponse:
-        return _FakeEmbedResponse(
-            embeddings=[[0.0] * CANONICAL_EMBED_DIM for _ in texts]
-        )
-
-
-async def _fake_resolve_backend(
-    provider: Any = None, org_config: Any = None, mode: Any = None
-) -> _FakeEmbedBackend:
-    return _FakeEmbedBackend()
+def _patch_embedder(monkeypatch: Any) -> None:
+    """Point both embedder entrypoints at ``_fake_embed``."""
+    monkeypatch.setattr("core.embeddings.embed_query", _fake_embed)
+    monkeypatch.setattr("core.embeddings.embed_passage", _fake_embed)
 
 
 @pytest.fixture()
@@ -158,7 +148,7 @@ def _search_dispatcher(isolated_app: Any) -> None:
 
 @pytest.fixture()
 def _fake_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("core.llm.resolve_backend", _fake_resolve_backend)
+    _patch_embedder(monkeypatch)
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 
 - ``GET /health`` — lightweight liveness check (always returns 200).
 - ``GET /ready`` — readiness check that validates connectivity to
-  PostgreSQL and Redis.
+  PostgreSQL and Redis, plus the prewarmed embedder.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from core._version import __version__
+from core.embeddings import is_model_loaded
 from schemas.health import HealthResponse
 
 router = APIRouter()
@@ -47,6 +48,10 @@ async def readiness(request: Request) -> JSONResponse:
     checks = {
         "database": db_health,
         "redis": redis_health,
+        # 503 until the boot-time embedder prewarm completes; /health stays
+        # liveness-only. Lifespan prewarm runs before serving traffic, so a
+        # False here means startup was bypassed (e.g. tests) — fail closed.
+        "embeddings": is_model_loaded(),
     }
     all_healthy = all(checks.values())
 
