@@ -370,6 +370,121 @@ PY
     chmod 600 "$ENV_FILE"
 }
 
+# ── 9. Host-dev Ollama embed URL seed (native Ollama on host) ───────────────
+# Host-run uvicorn cannot resolve the compose-DNS name `ollama`, so the
+# default OLLAMA_EMBED_URL (http://ollama:11434) fail-fasts the lifespan
+# prewarm with DNS [Errno -2]. When a NATIVE Ollama answers on
+# 127.0.0.1:11434 but `ollama` does not resolve from the host, seed
+# OZ_OLLAMA_EMBED_URL=http://127.0.0.1:11434 into the OpenBao system
+# secret (same namespace/path + read-merge-put mechanism as
+# write_db_to_openbao.sh, CAS-guarded). Idempotent: skips the write when
+# the stored value already matches. Never touches .env (bootstrap-only).
+host_resolves_ollama() {
+    if command -v getent >/dev/null 2>&1; then
+        getent hosts ollama >/dev/null 2>&1
+    else
+        python3 -c 'import socket; socket.gethostbyname("ollama")' >/dev/null 2>&1
+    fi
+}
+
+EFFECTIVE_EMBED_URL="http://ollama:11434"
+
+seed_host_ollama_embed_url() {
+    local host_url="http://127.0.0.1:11434"
+    local want=""
+    if curl -sf "${host_url}/api/tags" >/dev/null 2>&1; then
+        if host_resolves_ollama; then
+            log "'ollama' resolves from host — default embed URL works, skip."
+        else
+            want="$host_url"
+            log "Native Ollama up but 'ollama' unresolvable — seeding system secret ..."
+        fi
+    else
+        log "No native Ollama on 127.0.0.1:11434 — leaving embed URL as stored."
+    fi
+    # One docker call: merge-seed (only when want is set and stale) and
+    # print the resulting effective URL to stdout (human logs go to stderr
+    # so the capture stays clean). A bare `bao kv put key=val` would wipe
+    # the other system keys — hence read-merge-put, like write_db_to_openbao.
+    EFFECTIVE_EMBED_URL="$(docker run --rm -i --network host --entrypoint python3 \
+        -e BAO_ADDR="$BAO_ADDR" \
+        -e BAO_SKIP_VERIFY=true \
+        -e OZ_OLLAMA_WANT="$want" \
+        -v "$OPENBAO_INIT_VOL:/bao-init" \
+        "$OPENBAO_INIT_IMAGE" - <<'PYEOF'
+import json
+import os
+import subprocess
+import sys
+
+NAMESPACE = "system/"
+SECRET_PATH = "config/system"
+DEFAULT_URL = "http://ollama:11434"
+
+with open("/bao-init/root-token") as _f:
+    os.environ["BAO_TOKEN"] = _f.read().strip()
+
+want = os.environ.get("OZ_OLLAMA_WANT", "")
+
+result = subprocess.run(
+    ["bao", "kv", "get", "-namespace=" + NAMESPACE, "-format=json", SECRET_PATH],
+    capture_output=True, text=True,
+    env={**os.environ, "BAO_TOKEN": os.environ["BAO_TOKEN"]},
+)
+if result.returncode != 0:
+    if "not found" in result.stderr.lower() or "no value found" in result.stderr.lower():
+        print("[ollama-seed] No existing system secret — starting empty", file=sys.stderr)
+        existing, version = {}, 0
+    else:
+        sys.exit("FATAL: bao kv get failed: " + result.stderr.strip())
+else:
+    parsed = json.loads(result.stdout)
+    existing = parsed.get("data", {}).get("data", {})
+    version = parsed.get("data", {}).get("metadata", {}).get("version", 0)
+
+if want and existing.get("OZ_OLLAMA_EMBED_URL") != want:
+    existing["OZ_OLLAMA_EMBED_URL"] = want
+    args = ["bao", "kv", "put", "-namespace=" + NAMESPACE]
+    if version > 0:
+        args.append("-cas=" + str(version))
+    args.append(SECRET_PATH)
+    for k, v in existing.items():
+        args.append(k + "=" + str(v))
+    result = subprocess.run(
+        args, capture_output=True, text=True,
+        env={**os.environ, "BAO_TOKEN": os.environ["BAO_TOKEN"]},
+    )
+    if result.returncode != 0:
+        sys.exit("FATAL: bao kv put failed: " + result.stderr.strip())
+    print("[ollama-seed] Seeded OZ_OLLAMA_EMBED_URL=" + want, file=sys.stderr)
+else:
+    print("[ollama-seed] OZ_OLLAMA_EMBED_URL already correct — no write", file=sys.stderr)
+
+print(existing.get("OZ_OLLAMA_EMBED_URL", "") or DEFAULT_URL)
+PYEOF
+)"
+}
+
+# ── 10. Embeddings preflight probe (fail-fast before uvicorn) ───────────────
+# The API lifespan prewarms embeddings and aborts boot when Ollama is
+# unreachable — catch that here with an actionable message instead of a
+# traceback after `make dev`.
+probe_embeddings() {  # $1 = effective embed URL (resolved in section 9)
+    if curl -sf "$1/api/tags" >/dev/null 2>&1; then
+        log "Embeddings backend reachable at $1 (/api/tags OK)."
+        return 0
+    fi
+    cat >&2 <<EOF
+[dev_preflight] FATAL: Ollama not reachable at $1 (/api/tags failed).
+The API lifespan prewarms embeddings and fail-fasts at boot without it.
+Fix (native Ollama on host):
+  ollama serve &
+  ollama pull nomic-embed-text:v1.5
+Then re-run: scripts/dev_preflight.sh up
+EOF
+    exit 1
+}
+
 up() {
     gen_secrets
     ensure_postgres
@@ -380,6 +495,8 @@ up() {
     # Unconditional every run: secret_ids rotate on each bootstrap, so .env must re-sync.
     bootstrap
     sync_env
+    seed_host_ollama_embed_url
+    probe_embeddings "$EFFECTIVE_EMBED_URL"
     log "Done. Dev deps up. API: uvicorn services.api.asgi:app --reload --host 0.0.0.0"
 }
 

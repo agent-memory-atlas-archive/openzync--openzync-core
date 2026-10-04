@@ -172,10 +172,11 @@ def create_app() -> FastAPI:
             raise
 
         # ── Prewarm the frozen embedder (fail-fast) ─────────────────────
-        # DB/Redis/graph backends are up; load the ONNX model and run one
-        # dummy inference before serving traffic. A corrupt or missing
-        # model bake raises here and aborts boot — no try/except, loud by
-        # design — instead of surfacing as user-facing 503s.
+        # DB/Redis/graph backends are up; prove Ollama /api/embed is
+        # reachable and run one warm inference before serving traffic.
+        # An unreachable Ollama raises here and aborts boot — no
+        # try/except, loud by design — instead of surfacing as
+        # user-facing 503s.
         from core.embeddings import prewarm_embeddings
 
         await prewarm_embeddings()

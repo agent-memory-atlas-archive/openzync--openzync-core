@@ -50,7 +50,7 @@ except RuntimeError:
     import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-        _pool.submit(asyncio.run, _bootstrap()).result()
+        _pool.submit(lambda: asyncio.run(_bootstrap())).result()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Monkey-patch: Fix FastAPI 0.115.x regression where `-> None` annotation
