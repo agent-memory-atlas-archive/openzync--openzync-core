@@ -58,11 +58,12 @@
 #   `# TechLead note:` in the services block.
 #
 # Profiles:
-#   --profile llm            (Ollama)
 #   --profile observability  (Prometheus + Grafana + Alloy)
 #   --profile local-db       (Postgres + init + migrate + write-db to OpenBao)
 #   --profile alt-graph      (SurrealDB — optional extra graph backend;
 #                             FalkorDB is now part of the default stack)
+# Ollama is DEFAULT (not a profile): one shared container replaces 2x
+# in-process ONNX embedders (~700-785MB/process OOM on the 1.9GB VPS).
 #
 # Required env vars (no defaults — compose will refuse to start if absent):
 #   BAO_STATIC_SEAL_KEY      64-char hex (openssl rand -hex 32)
@@ -366,6 +367,8 @@ services:
         condition: service_healthy
       falkordb:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     volumes:
       - api-secrets:/run/secrets:ro   # RO — the app must never write secrets
       - openbao-init-data:/openbao-bootstrap:ro  # AppRole credentials for runtime auth
@@ -428,6 +431,8 @@ services:
         condition: service_healthy
       falkordb:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     volumes:
       - worker-secrets:/run/secrets:ro
       - openbao-init-data:/openbao-bootstrap:ro  # AppRole credentials for runtime auth
@@ -445,6 +450,10 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["127.0.0.1:6380:6379"]
+    # Cap cache memory to free ~200MB headroom on the 1.9GB VPS. No
+    # persistence conflict: redis-data still holds RDB snapshots in /data;
+    # --maxmemory only bounds evictable keys (allkeys-lru), appendonly stays off.
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
       - redis-data:/data
     healthcheck:
@@ -536,13 +545,34 @@ services:
     logging: *default-logging
     restart: "no"
 
-  # ── Ollama (local LLM inference) — OPTIONAL ──────────────────────────────
+  # ── Ollama (shared embedding inference) — DEFAULT ─────────────────────
+  # One container (~100MB idle, ~300MB with nomic-embed-text:v1.5 loaded)
+  # replaces 2x in-process ONNX embedders that OOM-killed the 1.9GB VPS.
+  # api + worker reach it at http://ollama:11434 (compose DNS).
   ollama:
-    profiles: [llm]
-    image: ollama/ollama:latest
-    ports: ["11434:11434"]
+    # Tag-pinned (was :latest for reproducibility). Digest pin lives here —
+    # resolve via `docker buildx imagetools inspect ollama/ollama:<tag>`
+    # and append @sha256:<digest> when CI next touches this line.
+    image: ollama/ollama:0.11.2
+    container_name: openzync-ollama
+    ports: ["127.0.0.1:11434:11434"]
+    environment:
+      OLLAMA_KEEP_ALIVE: "24h"   # keep nomic-embed-text resident, skip reloads
+      OLLAMA_HOST: "0.0.0.0:11434"
     volumes:
+      # Persist pulled models across restarts — 274MB pull happens once.
       - ollama-data:/root/.ollama
+    healthcheck:
+      # curl preferred; `ollama ps` fallback (image may lack curl in future tags).
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 || ollama ps >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12   # ~2min — covers cold start + model load
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: "512M" }
+        reservations: { cpus: "0.25", memory: "350M" }
     logging: *default-logging
     restart: unless-stopped
 

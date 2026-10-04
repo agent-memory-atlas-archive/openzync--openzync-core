@@ -114,6 +114,10 @@ config:
   llmBackend: "ollama"
   llmModel: "llama3.2:3b"
   ollamaBaseUrl: "http://ollama:11434"
+  # Shared Ollama embedder (compose default stack). Same host/port as
+  # ollamaBaseUrl — separate key so embeds survive LLM provider changes.
+  # No Ollama container in this chart by decision (external/shared service).
+  ollamaEmbedUrl: "http://ollama:11434"
 
   # Graph backend
   graphBackend: "falkordb"

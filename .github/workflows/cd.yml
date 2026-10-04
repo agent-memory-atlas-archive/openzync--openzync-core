@@ -179,7 +179,33 @@ jobs:
             ENVEOF
 
             # ── Deploy backend: pull → migrate → restart ───────────────────
+            # ── VPS SWAP RUNBOOK (documented, NOT executed — 1.9GB/0-swap host):
+            #    if `free -m` shows < 400MB free at deploy time, create a 2G
+            #    swapfile ONCE via VPS console (never from CI):
+            #      fallocate -l 2G /swapfile && chmod 600 /swapfile &&
+            #      mkswap /swapfile && swapon /swapfile &&
+            #      grep -q /swapfile /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
             docker compose --env-file .env -f infra/docker-compose.backend.yml pull
+
+            # ── Ollama embedder: start → pull model → warm (BEFORE api/worker) ──
+            # api/worker embed via http://ollama:11434; the model (274MB) must
+            # be resident before their prewarm runs, or first embeds time out.
+            # docker exec on the running container (stable name openzync-ollama)
+            # works on a freshly created container; `run --rm` would fight it
+            # for the 11434 port + ollama-data volume lock.
+            docker compose --env-file .env -f infra/docker-compose.backend.yml up -d ollama
+            docker exec openzync-ollama ollama pull nomic-embed-text:v1.5
+            # Warm the model into memory; retry up to ~5 min (pull is 274MB).
+            for i in $(seq 1 60); do
+              if curl -s -X POST http://localhost:11434/api/embed \
+                  -d '{"model":"nomic-embed-text:v1.5","input":["ready"],"keep_alive":"24h"}' \
+                  | grep -q embeddings; then
+                echo "ollama embed warm OK (attempt $i)"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then echo "ollama embed warm FAILED after ~5min" >&2; exit 1; fi
+              sleep 5
+            done
 
             # Run migrations via docker compose run. This creates an
             # infra-api-run-* container tracked by compose as the "api"

@@ -1,39 +1,39 @@
-"""The embedder — one local ONNX model, one frozen dimension.
+"""The embedder — Ollama is the sole embedding backend.
 
-Embeddings are produced in-process by a single hardcoded model:
-``nomic-ai/nomic-embed-text-v1.5`` served by ``qdrant/fastembed`` (ONNX
-runtime — no torch, no ``trust_remote_code``, no network call per
-inference). There is no provider routing, no per-org backend selection,
-and no env-var override: the model name below is the whole
-configuration surface.
+Embeddings are produced out-of-process by a single hardcoded model,
+``nomic-embed-text:v1.5``, served by the Ollama service's ``/api/embed``
+endpoint (same v1.5 weights as the retired in-process ONNX build, still
+768 dims — which is why no migration was needed). There is no provider
+routing, no per-org backend selection, and no env-var model override:
+the model tag below is the whole configuration surface. Only the
+server address is configurable, via the system-level
+``OLLAMA_EMBED_URL`` setting (default ``http://ollama:11434``).
 
 Two columns enforce the dimension at the schema level —
 ``episodes.embedding`` and ``facts.embedding`` are both ``VECTOR(768)``
 with a CHECK constraint and an HNSW cosine index — so every vector must
-be exactly :data:`CANONICAL_EMBED_DIM` floats. ``nomic-embed-text-v1.5``
-is 768-dimensional, which is why the swap to a local model was possible
-at all.
+be exactly :data:`CANONICAL_EMBED_DIM` floats.
 
 Rules enforced through this module:
 
-- **Asymmetric prefixes.** ``nomic-embed-text-v1.5`` is a Matryoshka
-  model trained with distinct search/document prefixes. Corrupting them
-  is silent — you get 768 valid floats and quietly degraded recall — so
-  write paths must call :func:`embed_passage` and the query path must
-  call :func:`embed_query`. Never unify them.
-- **The prefixes are applied here, not by fastembed.** The model card
-  marks them mandatory and fastembed's own registry metadata says
-  *"Prefixes for queries/documents: necessary"*, yet
-  ``passage_embed``/``query_embed`` pass their input straight through to
-  ``embed()`` for this model (only ``JinaEmbeddingV3`` overrides them,
-  with a ``task_id``). Both entrypoints below therefore prepend
-  :data:`PASSAGE_PREFIX` / :data:`QUERY_PREFIX` themselves.
-- **Unit norms are guaranteed here.** fastembed registers this model as
-  ``PooledEmbedding`` (mean-pool only, *unnormalized* — observed norms
-  around 20.0), so the raw vectors are normalised at this boundary.
+- **Asymmetric prefixes.** ``nomic-embed-text-v1.5`` is trained with
+  distinct search/document prefixes. Corrupting them is silent — you
+  get 768 valid floats and quietly degraded recall — so write paths
+  must call :func:`embed_passage` and the query path must call
+  :func:`embed_query`. Never unify them.
+- **The prefixes are applied here, not by Ollama.** The model card
+  marks them mandatory and ``/api/embed`` takes raw input strings, so
+  both entrypoints below prepend :data:`PASSAGE_PREFIX` /
+  :data:`QUERY_PREFIX` themselves.
+- **Unit norms are guaranteed here.** Ollama returns raw unnormalized
+  vectors, so every batch is normalised at this boundary —
+  verify-then-normalize, unconditionally.
 - Every returned vector passes through :func:`validate_embedding_dim`
-  before it reaches a caller, so a wrong-shape vector fails loud at this
-  single choke point instead of at the ``CAST(... AS vector(768))``.
+  before it reaches a caller, so a wrong-shape vector fails loud at
+  this single choke point instead of at the ``CAST(... AS vector(768))``.
+- **No fallback.** A failed inference raises — never zeros, never
+  skips, never a local model. Duplicate delivery is fine; duplicate
+  side effects are not, so callers stay idempotent instead.
 
 ⚠️ A same-dimension model swap is invisible to
 :func:`validate_embedding_dim`. Stored vectors from the previous model
@@ -45,19 +45,16 @@ space. After changing :data:`CANONICAL_EMBED_MODEL`, run
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+
+import httpx
 
 from core.exceptions import ExternalServiceError
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
 logger = logging.getLogger(__name__)
 
-CANONICAL_EMBED_MODEL: str = "nomic-ai/nomic-embed-text-v1.5"
+CANONICAL_EMBED_MODEL: str = "nomic-embed-text:v1.5"
 """The single embedding model all stored vectors are produced with."""
 
 CANONICAL_EMBED_DIM: int = 768
@@ -66,10 +63,8 @@ CANONICAL_EMBED_DIM: int = 768
 MODEL_REVISION: str | None = None
 """Pinned revision of :data:`CANONICAL_EMBED_MODEL`, if one is published.
 
-fastembed's registry metadata for ``nomic-ai/nomic-embed-text-v1.5`` publishes
-no revision digest (only the model id, file path, and dim), so there is
-nothing stable to pin here — this stays ``None`` and the Docker bake step
-pins the weights via build-arg instead. Do NOT invent a hash.
+The pin IS the Ollama tag — Ollama tags are mutable, so digest-pinning
+lives in infra (image/model digest), not here. Do NOT invent a hash.
 """
 
 PASSAGE_PREFIX: str = "search_document: "
@@ -78,16 +73,29 @@ PASSAGE_PREFIX: str = "search_document: "
 QUERY_PREFIX: str = "search_query: "
 """Mandatory task prefix for the query side. Applied by :func:`embed_query`."""
 
-# ── Module-level model cache (double-checked locking) ──────────────────────
+OLLAMA_KEEP_ALIVE: str = "24h"
+"""``keep_alive`` sent on every ``/api/embed`` call — keeps the 274MB
+F16 weights resident so steady-state inference never pays a reload."""
 
-_MODEL: Any = None
-"""Lazily-constructed ``fastembed.TextEmbedding``. ``None`` until first use."""
+EMBED_TIMEOUT_S: float = 30.0
+"""Per-request timeout for ``/api/embed`` (10–30s budget)."""
 
-_MODEL_LOCK: asyncio.Lock = asyncio.Lock()
-"""Guards construction so concurrent first-callers load the model once."""
+_DEFAULT_BASE_URL: str = "http://ollama:11434"
+"""Compose-DNS default for the Ollama server. Overridden by the
+system-level ``OLLAMA_EMBED_URL`` setting once settings initialise."""
+
+# ── Module-level HTTP client (lazy) ───────────────────────────────────
+
+_CLIENT: httpx.AsyncClient | None = None
+"""Shared client. Created lazily — never at import time, so importing
+this module needs no running loop and no reachable Ollama."""
+
+_WARMED: bool = False
+"""True once an inference has succeeded in this process (set by
+:func:`prewarm_embeddings` at boot or by the first successful embed)."""
 
 
-# ── Public API ──────────────────────────────────────────────────────────────
+# ── Public API ─────────────────────────────────────────────────────────
 
 
 async def embed_passage(texts: list[str]) -> list[list[float]]:
@@ -97,7 +105,7 @@ async def embed_passage(texts: list[str]) -> list[list[float]]:
     ``facts.embedding``. Calling :func:`embed_query` here silently
     degrades retrieval quality — the prefixes are not interchangeable.
 
-    The prefix is prepended by this module, because fastembed does not
+    The prefix is prepended by this module, because Ollama does not
     prepend it (see the module docstring) — callers pass bare text.
 
     Args:
@@ -107,22 +115,19 @@ async def embed_passage(texts: list[str]) -> list[list[float]]:
         A list of 768-float unit vectors, positionally matching ``texts``.
 
     Raises:
-        ExternalServiceError: If the embedder returns a vector that is not
-            exactly :data:`CANONICAL_EMBED_DIM` floats, or a zero-norm
-            vector (unnormalisable, and NaN-poisoning downstream).
-        ImportError: If ``fastembed`` is not installed.
-        Exception: Whatever ``fastembed``/``onnxruntime`` raises on load or
-            inference — propagated unmodified, never swallowed.
+        ExternalServiceError: If the embedder returns a vector that is
+            not exactly :data:`CANONICAL_EMBED_DIM` floats, a zero-norm
+            vector (unnormalisable, and NaN-poisoning downstream), or a
+            malformed payload (missing key, count mismatch).
+        Exception: Whatever ``httpx`` raises on connection or inference
+            — logged with the model tag, propagated unmodified, never
+            swallowed.
     """
-    model = await _ensure_model()
-    # note: the prefix is NOT optional — fastembed's passage_embed does not
-    # add it for this model, and omitting it silently degrades recall with no
-    # error. Do not "simplify" this into a bare pass-through of `texts`.
-    vectors = await _run_off_loop(
-        lambda: _consume(
-            model.passage_embed, texts, prefix=PASSAGE_PREFIX, source="embed_passage"
-        ),
-        source="embed_passage",
+    # note: the prefix is NOT optional — /api/embed takes raw strings,
+    # and omitting it silently degrades recall with no error. Do not
+    # "simplify" this into a bare pass-through of `texts`.
+    vectors = await _post_embed(
+        [PASSAGE_PREFIX + text for text in texts], source="embed_passage"
     )
     for vec in vectors:
         validate_embedding_dim(vec, source="embed_passage")
@@ -136,7 +141,7 @@ async def embed_query(texts: list[str]) -> list[list[float]]:
     :meth:`services.hybrid_retriever.HybridRetriever._embed_query`).
     Calling :func:`embed_passage` here silently degrades recall.
 
-    The prefix is prepended by this module, because fastembed does not
+    The prefix is prepended by this module, because Ollama does not
     prepend it (see the module docstring) — callers pass bare text.
 
     Args:
@@ -147,20 +152,17 @@ async def embed_query(texts: list[str]) -> list[list[float]]:
         A list of 768-float unit vectors, positionally matching ``texts``.
 
     Raises:
-        ExternalServiceError: If the embedder returns a vector that is not
-            exactly :data:`CANONICAL_EMBED_DIM` floats, or a zero-norm
-            vector (unnormalisable, and NaN-poisoning downstream).
-        ImportError: If ``fastembed`` is not installed.
-        Exception: Whatever ``fastembed``/``onnxruntime`` raises on load or
-            inference — propagated unmodified, never swallowed.
+        ExternalServiceError: If the embedder returns a vector that is
+            not exactly :data:`CANONICAL_EMBED_DIM` floats, a zero-norm
+            vector (unnormalisable, and NaN-poisoning downstream), or a
+            malformed payload (missing key, count mismatch).
+        Exception: Whatever ``httpx`` raises on connection or inference
+            — logged with the model tag, propagated unmodified, never
+            swallowed.
     """
-    model = await _ensure_model()
     # note: see embed_passage — the prefix is mandatory and applied here.
-    vectors = await _run_off_loop(
-        lambda: _consume(
-            model.query_embed, texts, prefix=QUERY_PREFIX, source="embed_query"
-        ),
-        source="embed_query",
+    vectors = await _post_embed(
+        [QUERY_PREFIX + text for text in texts], source="embed_query"
     )
     for vec in vectors:
         validate_embedding_dim(vec, source="embed_query")
@@ -196,75 +198,234 @@ def validate_embedding_dim(vec: list[float], *, source: str) -> None:
 
 
 def is_model_loaded() -> bool:
-    """Report whether the ONNX model has finished loading in this process.
+    """Report whether the embedder has proven reachable in this process.
 
     Used by readiness probes so ``/ready`` stays 503 until the boot-time
     :func:`prewarm_embeddings` completes, while ``/health`` stays
     liveness-only.
 
     Returns:
-        True once :func:`_ensure_model` has cached the model, else False.
+        True once an inference has succeeded (prewarm or first embed),
+        else False.
     """
-    return _MODEL is not None
+    return _WARMED
 
 
 async def prewarm_embeddings() -> None:
-    """Load the model and run one dummy inference.
+    """Prove Ollama reachable and run one warm inference.
 
-    Called once at boot (API lifespan, worker startup) so a corrupt or
-    missing model bake fails fast instead of surfacing as user-facing 503s.
+    Called once at boot (API lifespan, worker startup) so an unreachable
+    Ollama fails fast instead of surfacing as user-facing 503s.
     Callers must NOT catch — any error aborts startup loudly by design.
 
     Raises:
-        Exception: Whatever model load or inference raises, unmodified.
+        Exception: Whatever the reachability check or warm inference
+            raises, unmodified.
     """
-    await _ensure_model()
+    await _check_reachable()
     await embed_query(["ready"])
 
 
-# ── Internal helpers ────────────────────────────────────────────────────────
+# ── Internal helpers ───────────────────────────────────────────────────
 
 
-def _consume(
-    embed: Callable[[list[str]], Any],
-    texts: list[str],
-    *,
-    prefix: str,
-    source: str,
-) -> list[list[float]]:
-    """Prefix, drain and normalise one fastembed batch into nested lists.
+def _embed_base_url() -> str:
+    """Return the configured Ollama base URL.
 
-    Must be called on a worker thread — ``passage_embed``/``query_embed``
-    are generators over synchronous ONNX inference, so merely constructing
-    the generator costs nothing while iterating it blocks.
+    Reads the system-level ``OLLAMA_EMBED_URL`` setting. When settings
+    are not initialised yet (unit tests, operator scripts), the
+    compose-DNS default applies — the same value the setting defaults
+    to, so behaviour never diverges silently.
+
+    Returns:
+        The base URL with no trailing slash.
+    """
+    try:
+        from core.config import get_settings  # noqa: PLC0415
+
+        url = get_settings().OLLAMA_EMBED_URL
+    except (RuntimeError, AttributeError):
+        return _DEFAULT_BASE_URL
+    return (url or _DEFAULT_BASE_URL).rstrip("/")
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Return the shared client, creating it lazily on first use.
+
+    Creation is synchronous and loop-free, so this is safe to call from
+    any coroutine without lifespan wiring.
+
+    Returns:
+        The module-level shared ``httpx.AsyncClient``.
+    """
+    global _CLIENT  # noqa: PLW0603 — intentional module-level cache
+    if _CLIENT is None:
+        _CLIENT = httpx.AsyncClient(timeout=EMBED_TIMEOUT_S)
+    return _CLIENT
+
+
+async def _check_reachable() -> None:
+    """GET Ollama's ``/api/tags`` to prove the embed server is up.
+
+    Raises:
+        Exception: Whatever ``httpx`` raises — logged with the model
+            tag, propagated unmodified, never swallowed.
+    """
+    client = _get_client()
+    url = f"{_embed_base_url()}/api/tags"
+    started = time.perf_counter()
+    try:
+        resp = await client.get(url)
+        resp.raise_for_status()
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - started) * 1000, 1)
+        logger.error(
+            "embeddings.prewarm_unreachable",
+            extra={
+                "model": CANONICAL_EMBED_MODEL,
+                "error": str(exc),
+                "duration_ms": duration_ms,
+            },
+            exc_info=True,
+        )
+        raise
+
+
+async def _post_embed(texts: list[str], *, source: str) -> list[list[float]]:
+    """POST one prefixed batch to Ollama ``/api/embed`` and normalise.
+
+    Runs fully on-loop — a single ``httpx`` POST needs no executor, and
+    the numpy normalisation below is trivial. Exactly one retry on
+    transient transport errors, then fail loud; HTTP error statuses fail
+    immediately with the status and body snippet logged.
 
     Args:
-        embed: Bound fastembed method (``passage_embed``/``query_embed``).
-            Typed loosely because it yields numpy arrays and numpy is
-            imported lazily below.
-        texts: Raw caller text, prefixed here — fastembed does not prefix.
-        prefix: The task prefix to prepend to every text, e.g.
-            :data:`PASSAGE_PREFIX`.
+        texts: Already-prefixed input strings (prefix applied by the
+            caller — this helper must never see bare text).
+        source: Caller name for error details and log extras.
+
+    Returns:
+        One unit-norm list of floats per input text, in order. Empty in,
+        empty out — no HTTP call for an empty batch.
+
+    Raises:
+        ExternalServiceError: If the payload is malformed (missing
+            ``embeddings`` key, count mismatch) or any row has zero (or
+            NaN) norm, which cannot be normalised into a unit vector.
+        Exception: Whatever ``httpx`` raises — logged with the model
+            tag, propagated unmodified, never swallowed.
+    """
+    global _WARMED  # noqa: PLW0603 — intentional module-level flag
+    if not texts:
+        _get_client()
+        return []
+
+    client = _get_client()
+    url = f"{_embed_base_url()}/api/embed"
+    payload = {
+        "model": CANONICAL_EMBED_MODEL,
+        "input": texts,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+    }
+    started = time.perf_counter()
+    data: dict = {}
+    for attempt in (1, 2):
+        try:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except httpx.HTTPStatusError as exc:
+            duration_ms = round((time.perf_counter() - started) * 1000, 1)
+            logger.error(
+                "embeddings.inference_failed",
+                extra={
+                    "source": source,
+                    "model": CANONICAL_EMBED_MODEL,
+                    "status_code": exc.response.status_code,
+                    "detail": exc.response.text[:500],
+                    "duration_ms": duration_ms,
+                },
+                exc_info=True,
+            )
+            raise
+        except httpx.TransportError as exc:
+            if attempt == 2:
+                duration_ms = round((time.perf_counter() - started) * 1000, 1)
+                logger.error(
+                    "embeddings.inference_failed",
+                    extra={
+                        "source": source,
+                        "model": CANONICAL_EMBED_MODEL,
+                        "error": str(exc),
+                        "duration_ms": duration_ms,
+                    },
+                    exc_info=True,
+                )
+                raise
+            logger.warning(
+                "embeddings.inference_retry",
+                extra={
+                    "source": source,
+                    "model": CANONICAL_EMBED_MODEL,
+                    "attempt": attempt,
+                    "error": str(exc),
+                },
+            )
+    duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    logger.info(
+        "embeddings.inference_completed",
+        extra={
+            "source": source,
+            "model": CANONICAL_EMBED_MODEL,
+            "count": len(texts),
+            "duration_ms": duration_ms,
+        },
+    )
+
+    rows = data.get("embeddings")
+    if not isinstance(rows, list) or len(rows) != len(texts):
+        raise ExternalServiceError(
+            message=(
+                f"Invalid embedding in {source}: Ollama returned "
+                f"{len(rows) if isinstance(rows, list) else type(rows).__name__} "
+                f"vectors for {len(texts)} inputs. Refusing to store."
+            ),
+            detail={
+                "source": source,
+                "got": len(rows) if isinstance(rows, list) else 0,
+                "expected": len(texts),
+            },
+        )
+    vectors = _normalize_vectors([list(row) for row in rows], source=source)
+    _WARMED = True
+    return vectors
+
+
+def _normalize_vectors(rows: list[list[float]], *, source: str) -> list[list[float]]:
+    """Normalise one Ollama batch into unit-norm nested lists.
+
+    Ollama returns raw unnormalized vectors, so normalisation happens
+    unconditionally at this boundary — every stored vector has a
+    guaranteed unit norm, and a future switch to dot-product / ``<#>``
+    index ops cannot silently change the ranking scale.
+
+    Args:
+        rows: Raw vectors from ``/api/embed`` (already count-checked).
         source: Caller name for the error detail.
 
     Returns:
-        One list of floats per input text, each exactly unit-norm.
+        One unit-norm list of floats per input row.
 
     Raises:
-        ExternalServiceError: If any returned row has zero (or NaN) norm,
-            which cannot be normalised into a unit vector.
+        ExternalServiceError: If any row has zero (or NaN) norm, which
+            cannot be normalised into a unit vector.
     """
-    import numpy as np
+    import numpy as np  # noqa: PLC0415 — keeps module import light
 
-    matrix = np.array(list(embed([prefix + text for text in texts])))
-    if matrix.size == 0:
+    if not rows:
         return []
-
-    # fastembed registers this model as PooledEmbedding — mean-pool only, no
-    # normalisation (observed norms ~20). Normalise at the boundary so every
-    # stored vector has a guaranteed unit norm regardless of what fastembed
-    # hands back, and so a future switch to dot-product / <#> index ops cannot
-    # silently change the ranking scale.
+    matrix = np.array(rows, dtype=np.float64)
     norms = np.linalg.norm(matrix, axis=-1, keepdims=True)
     if not bool(np.all(norms > 0)):
         raise ExternalServiceError(
@@ -278,99 +439,6 @@ def _consume(
             },
         )
     return (matrix / norms).tolist()
-
-
-async def _run_off_loop(
-    fn: Callable[[], list[list[float]]], *, source: str
-) -> list[list[float]]:
-    """Run *fn* on the default executor so ONNX inference never blocks asyncio.
-
-    Args:
-        fn: Zero-arg callable doing the full consume-and-convert work.
-        source: Caller name for the error log.
-
-    Returns:
-        Whatever *fn* returned.
-
-    Raises:
-        Exception: Whatever *fn* raised, after a structured error log.
-    """
-    loop = asyncio.get_running_loop()
-    started = time.perf_counter()
-    try:
-        return await loop.run_in_executor(None, fn)
-    except Exception as exc:
-        duration_ms = round((time.perf_counter() - started) * 1000, 1)
-        logger.error(
-            "embeddings.inference_failed",
-            extra={
-                "source": source,
-                "model": CANONICAL_EMBED_MODEL,
-                "error": str(exc),
-                "duration_ms": duration_ms,
-            },
-            exc_info=True,
-        )
-        raise
-
-
-async def _ensure_model() -> Any:
-    """Load the ONNX model with double-checked locking.
-
-    The instance is cached at module level, so every ``embed_passage`` /
-    ``embed_query`` caller in the process shares one loaded model.
-
-    Returns:
-        The loaded ``fastembed.TextEmbedding`` instance.
-
-    Raises:
-        ImportError: If ``fastembed`` is not installed.
-    """
-    global _MODEL
-    requested = time.perf_counter()
-    if _MODEL is not None:
-        return _MODEL
-
-    async with _MODEL_LOCK:
-        # Double-check — another coroutine may have loaded it while we
-        # were waiting for the lock.
-        if _MODEL is not None:
-            return _MODEL
-
-        try:
-            from fastembed import TextEmbedding  # noqa: PLC0415
-        except ImportError as err:
-            raise ImportError(
-                "fastembed is not installed — it is a base dependency. "
-                "Install with: pip install -e ."
-            ) from err
-
-        # Constructing the model hits the HF cache / disk — off the loop.
-        # duration_ms here is lock-wait time (load hasn't started yet); the
-        # load itself is timed on model_loaded below.
-        logger.info(
-            "embeddings.loading_model",
-            extra={
-                "model": CANONICAL_EMBED_MODEL,
-                "dim": CANONICAL_EMBED_DIM,
-                "duration_ms": round((time.perf_counter() - requested) * 1000, 1),
-            },
-        )
-        loop = asyncio.get_running_loop()
-        load_started = time.perf_counter()
-        model: Any = await loop.run_in_executor(
-            None,
-            lambda: TextEmbedding(CANONICAL_EMBED_MODEL, lazy_load=True),
-        )
-        _MODEL = model
-        logger.info(
-            "embeddings.model_loaded",
-            extra={
-                "model": CANONICAL_EMBED_MODEL,
-                "duration_ms": round((time.perf_counter() - load_started) * 1000, 1),
-            },
-        )
-        return _MODEL
 
 
 if __name__ == "__main__":  # pragma: no cover — operator self-check
@@ -396,7 +464,7 @@ if __name__ == "__main__":  # pragma: no cover — operator self-check
 
         # The prefixes must actually reach the model: the same text embedded on
         # both sides must NOT land on the same vector (both are unit vectors, so
-        # the dot product IS the cosine). Before the fix this was exactly 1.0.
+        # the dot product IS the cosine).
         probe = "openzyc persists agent memory in a pgvector graph"
         passage_vec = (await embed_passage([probe]))[0]
         query_vec = (await embed_query([probe]))[0]
@@ -407,7 +475,7 @@ if __name__ == "__main__":  # pragma: no cover — operator self-check
             f"prefixes not applied — identical text scored {same_text_cosine:.4f}"
         )
         print(
-            f"prefix asymmetry: OK — identical text cosine "
+            "prefix asymmetry: OK — identical text cosine "
             f"{same_text_cosine:.4f} < 0.999"
         )
 

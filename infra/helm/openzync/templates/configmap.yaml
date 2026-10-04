@@ -19,3 +19,4 @@ data:
   OZ_CORS_ORIGINS: {{ .Values.config.corsOrigins | quote }}
   OZ_OTLP_ENDPOINT: {{ .Values.config.otlpEndpoint | quote }}
   OLLAMA_BASE_URL: {{ .Values.config.ollamaBaseUrl | quote }}
+  OZ_OLLAMA_EMBED_URL: {{ .Values.config.ollamaEmbedUrl | quote }}

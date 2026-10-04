@@ -272,6 +272,16 @@ class Settings(BaseModel):
         ),
     )
 
+    # ── Embeddings (Ollama — sole embedder) ─────────────────────────────
+    OLLAMA_EMBED_URL: str = Field(
+        default="http://ollama:11434",
+        description=(
+            "Base URL of the Ollama server serving the sole embedding model "
+            "(nomic-embed-text:v1.5 via /api/embed). System-level only — no "
+            "per-org override, no model selection."
+        ),
+    )
+
     # ── Prompt Caching ────────────────────────────────────────────────────
     PROMPT_CACHING_ENABLED: bool = Field(
         default=True,
