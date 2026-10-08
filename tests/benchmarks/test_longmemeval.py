@@ -50,9 +50,17 @@ from types import SimpleNamespace
 
 import httpx
 
-from core.llm import LLMStructuredOutputError
+from core.llm import LLMStructuredOutputError, PromptCachingConfig
 
 logger = logging.getLogger(__name__)
+
+_NO_CACHE = PromptCachingConfig(enabled=False)
+"""Explicit caching-disabled config for benchmark QA calls.
+
+Benchmark pytest processes never call ``init_settings()``, so leaving
+``cache_config=None`` would make ``LLMBackend.chat()`` fall back to
+``build_cache_config()`` → ``get_settings()`` → ``RuntimeError``.
+"""
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -87,6 +95,13 @@ RESULTS_DIR: Path = (
 
 # Retryable HTTP status codes
 _RETRYABLE_STATUSES: set[int] = {429, 502, 503, 504}
+
+# httpx encodes ``data`` as ``application/x-www-form-urlencoded`` unless
+# ``files`` is truthy — an empty list/dict silently downgrades a multipart
+# call. ``_EMPTY_FILES`` is truthy yet iterates to zero parts, forcing
+# genuine multipart encoding with no file parts. Mirrors the SDK's
+# ``openzync._http._EMPTY_FILES`` sentinel.
+_EMPTY_FILES = iter(())
 
 #: Path for incremental progress saves (protects against partial data loss).
 _TMP_RESULTS_DIR: Path = RESULTS_DIR / ".in_progress"
@@ -375,12 +390,13 @@ async def _ingest_memory(
     token: str,
     project_id: str,
     messages: list[dict[str, str]],
-    session_id: str,
+    session_external_id: str,
 ) -> None:
     """Ingest a batch of messages into a session within a project.
 
     The session must already exist — the server never auto-creates
-    sessions from arbitrary IDs, so a missing ``session_id`` is a 422.
+    sessions from arbitrary IDs, so a missing ``session_external_id``
+    is a 422.
 
     Enrichment runs asynchronously in the background.
 
@@ -389,15 +405,35 @@ async def _ingest_memory(
         token: JWT access token.
         project_id: Target project UUID.
         messages: List of ``{"role": str, "content": str}`` dicts.
-        session_id: Session UUID to ingest into.
+        session_external_id: Session EXTERNAL id to ingest into (the
+            ``IngestMemoryRequest.session_id`` field carries the external
+            id, not the internal UUID).
     """
-    body: dict[str, object] = {"messages": messages, "session_id": session_id}
+    body: dict[str, object] = {
+        "messages": messages,
+        "session_id": session_external_id,
+    }
 
-    await _request_with_retry(
-        client, "POST", f"/v1/projects/{project_id}/memory",
-        json=body,
-        headers=_auth_header(token),
-    )
+    # Always multipart — the backend accepts only multipart/form-data
+    # (``data: str = Form(...)``), even for text-only calls; a plain
+    # JSON body is rejected with 422. ``files`` must be truthy or httpx
+    # silently downgrades to urlencoded — hence the ``_EMPTY_FILES``
+    # sentinel (mirrors the SDK's ``request_multipart``).
+    try:
+        await _request_with_retry(
+            client, "POST", f"/v1/projects/{project_id}/memory",
+            data={"data": json.dumps(body)},
+            files=_EMPTY_FILES,
+            headers=_auth_header(token),
+        )
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Ingest failed: HTTP %d on POST /v1/projects/%s/memory — body: %s",
+            exc.response.status_code,
+            project_id,
+            exc.response.text,
+        )
+        raise
 
 
 async def _wait_for_enrichment(
@@ -637,6 +673,7 @@ async def _answer_from_context(
         messages=messages,
         temperature=0.0,
         max_tokens=512,
+        cache_config=_NO_CACHE,
     )
     return response.content
 
@@ -646,6 +683,7 @@ def _save_results(
     config: SimpleNamespace,
     git_commit: str | None,
     version: str | None,
+    judge_model: str | None = None,
 ) -> Path:
     """Save benchmark results to a timestamped JSON file.
 
@@ -654,6 +692,9 @@ def _save_results(
         config: Benchmark configuration from CLI args.
         git_commit: Current git commit hash.
         version: OpenZync version string.
+        judge_model: Judge backend model name for the config label.
+            Falls back to ``NVIDIA_MODEL`` env (default NVIDIA model)
+            when not provided.
 
     Returns:
         Path to the saved results file.
@@ -683,7 +724,10 @@ def _save_results(
             "reranker_enabled": config.reranker,
             "baseline_mode": config.baseline,
             "benchmark_limit": config.benchmark_limit,
-            "llm_judge_model": "openai/gpt-oss-120b:free",
+            "llm_judge_model": judge_model
+            or os.environ.get(
+                "NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"
+            ),
             "judge_temperature": 0.0,
         },
         "metrics": metrics,
@@ -886,7 +930,13 @@ async def test_longmemeval_benchmark(
         metrics_baseline["r10"] = r10_baseline / total_baseline
 
     # Save results
-    saved_path = _save_results(results_full, benchmark_config, git_commit, version)
+    saved_path = _save_results(
+        results_full,
+        benchmark_config,
+        git_commit,
+        version,
+        judge_model=openai_backend.model_name,
+    )
     if results_baseline:
         base_config = SimpleNamespace(
             run_benchmark=benchmark_config.run_benchmark,
@@ -896,7 +946,11 @@ async def test_longmemeval_benchmark(
             variant=benchmark_config.variant,
         )
         baseline_path = _save_results(
-            results_baseline, base_config, git_commit, version
+            results_baseline,
+            base_config,
+            git_commit,
+            version,
+            judge_model=openai_backend.model_name,
         )
         # Rename to include _baseline suffix for clarity
         baseline_renamed = baseline_path.with_stem(baseline_path.stem + "_baseline")
@@ -977,12 +1031,14 @@ async def _run_benchmark_pipeline(
                 )
                 continue
 
-            # Create a session for this entry
-            session_id = await _create_session(
+            # Create a session for this entry (existence guarantee —
+            # ingest below references the session by its external id).
+            session_external_id = f"longmemeval_{entry_id}"
+            await _create_session(
                 api_client,
                 token,
                 project_id,
-                external_id=f"longmemeval_{entry_id}",
+                external_id=session_external_id,
             )
 
             # LongMemEval conversations may have many messages; batch if needed
@@ -991,7 +1047,7 @@ async def _run_benchmark_pipeline(
                 batch = messages[i : i + batch_size]
                 await _ingest_memory(
                     api_client, token, project_id, batch,
-                    session_id=session_id,
+                    session_external_id=session_external_id,
                 )
                 ingested_count += len(batch)
 

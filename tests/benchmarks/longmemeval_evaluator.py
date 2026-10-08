@@ -12,10 +12,21 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, Field
 
+from core.llm import PromptCachingConfig
+
 if TYPE_CHECKING:
     from core.llm import ChatResponse, LLMBackend
 
 logger = logging.getLogger(__name__)
+
+_NO_CACHE = PromptCachingConfig(enabled=False)
+"""Explicit caching-disabled config for benchmark judge calls.
+
+Benchmark pytest processes never call ``init_settings()``, so leaving
+``cache_config=None`` would make ``LLMBackend.chat()`` fall back to
+``build_cache_config()`` → ``get_settings()`` → ``RuntimeError``.
+Judge verdicts must not be cached anyway.
+"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -129,6 +140,7 @@ async def evaluate_answer(
         messages=messages,
         response_model=EvaluationResult,
         temperature=temperature,
+        cache_config=kwargs.pop("cache_config", _NO_CACHE),
         **kwargs,
     )
 

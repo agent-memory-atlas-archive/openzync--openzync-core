@@ -16,10 +16,12 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from core.llm_backends import OpenAIBackend
+from core.llm_backends import OpenAILikeBackend, OpenAIBackend
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    from core.llm import LLMBackend
 
 # ── Load local .env file (if available) ───────────────────────────────────────
 # This allows benchmark credentials (BENCH_EMAIL, OPENAI_API_KEY, etc.)
@@ -101,19 +103,34 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(scope="session")
-def openai_backend() -> Generator[OpenAIBackend, None, None]:
-    """Create an OpenAI LLM backend for benchmark evaluation.
+def openai_backend() -> Generator[LLMBackend, None, None]:
+    """Create an LLM backend for benchmark evaluation (NVIDIA-first).
 
-    Reads ``OPENAI_API_KEY`` from the environment.  Skips all
-    dependent tests if the key is not set.
+    Priority: ``NVIDIA_API_KEY`` (OpenAI-compatible NVIDIA endpoint) first,
+    then ``OPENAI_API_KEY``. Skips all dependent tests if neither key is set.
 
     Yields:
-        A configured ``OpenAIBackend`` instance using the default
-        chat model for reliable throughput.
+        A configured ``LLMBackend`` — ``OpenAILikeBackend`` for NVIDIA,
+        ``OpenAIBackend`` for OpenAI using the default chat model.
 
     Raises:
-        pytest.skip: If ``OPENAI_API_KEY`` is not set.
+        pytest.skip: If neither ``NVIDIA_API_KEY`` nor ``OPENAI_API_KEY``
+            is set.
     """
+    nvidia_key = os.environ.get("NVIDIA_API_KEY")
+    if nvidia_key:
+        backend: LLMBackend = OpenAILikeBackend(
+            base_url=os.environ.get(
+                "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"
+            ),
+            api_key=nvidia_key,
+            model=os.environ.get(
+                "NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"
+            ),
+        )
+        yield backend
+        return
+
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         logger.warning("OPENAI_API_KEY not set — skipping benchmark tests")
