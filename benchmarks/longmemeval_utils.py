@@ -50,7 +50,7 @@ _HF_BASE_URL: str = (
 def get_dataset_dir() -> Path:
     """Return the absolute path to the local LongMemEval data directory.
 
-    The directory is ``tests/benchmarks/data/longmemeval/`` resolved relative
+    The directory is ``benchmarks/data/longmemeval/`` resolved relative
     to this module's location on disk.
 
     Returns:
@@ -269,17 +269,11 @@ def compute_recall_at_k(
     if not top_k:
         return False
 
-    key_terms = {
-        word.lower()
-        for word in ground_truth.split()
-        if len(word) > 2
-    }
+    key_terms = {word.lower() for word in ground_truth.split() if len(word) > 2}
     if not key_terms:
         return False
 
-    combined_content = " ".join(
-        r.get("content", "") for r in top_k
-    ).lower()
+    combined_content = " ".join(r.get("content", "") for r in top_k).lower()
 
     return all(term in combined_content for term in key_terms)
 

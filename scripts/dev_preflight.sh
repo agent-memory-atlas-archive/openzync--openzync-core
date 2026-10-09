@@ -55,6 +55,12 @@ container_running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
 
 ensure_volume() { docker volume inspect "$1" >/dev/null 2>&1 || docker volume create "$1" >/dev/null; }
 
+ensure_tooling_image() {
+    docker image inspect "$OPENBAO_INIT_IMAGE" >/dev/null 2>&1 && return 0
+    log "Building OpenBao tooling image ${OPENBAO_INIT_IMAGE} ..."
+    docker build -f "${REPO_ROOT}/infra/Dockerfile.openbao-tooling" -t "$OPENBAO_INIT_IMAGE" "${REPO_ROOT}/infra"
+}
+
 wait_postgres() {
     for _ in $(seq 1 30); do
         docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres -h localhost >/dev/null 2>&1 && return 0
@@ -487,6 +493,7 @@ EOF
 
 up() {
     gen_secrets
+    ensure_tooling_image
     ensure_postgres
     ensure_redis
     ensure_falkordb

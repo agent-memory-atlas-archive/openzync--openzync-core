@@ -1,24 +1,35 @@
 """LongMemEval benchmark — measures retrieval quality and QA accuracy.
 
-This test ingests LongMemEval conversations into a live OpenZync instance,
-waits for asynchronous enrichment, queries the search and context endpoints,
-and evaluates both R@k (recall at k) and end-to-end QA accuracy.
+This harness ingests LongMemEval conversations into a live OpenZync
+instance, waits for asynchronous enrichment, queries the search and
+context endpoints, and evaluates both R@k (recall at k) and end-to-end
+QA accuracy.  Every question is checkpointed, so an interrupted run
+resumes instead of restarting.
 
 Usage:
     # Full run (default variant 's', no baseline, no reranker):
-    pytest tests/benchmarks/ --run-benchmark -v
+    python -m benchmarks
 
     # Quick run (10 questions):
-    pytest tests/benchmarks/ --run-benchmark --benchmark-limit=10 -v
+    python -m benchmarks --benchmark-limit 10
 
     # With baseline comparison (pure vector only):
-    pytest tests/benchmarks/ --run-benchmark --baseline -v
+    python -m benchmarks --baseline
 
     # With reranker enabled:
-    pytest tests/benchmarks/ --run-benchmark --reranker -v
+    python -m benchmarks --reranker
 
     # Oracle variant:
-    pytest tests/benchmarks/ --run-benchmark --variant=oracle -v
+    python -m benchmarks --variant oracle
+
+    # Resume an interrupted run (auto-resumes the newest matching
+    # checkpoint, or points at one manifest explicitly):
+    python -m benchmarks
+    python -m benchmarks --resume \
+        benchmarks/results/.in_progress/<manifest>.json
+
+    # Ignore existing checkpoints and start over:
+    python -m benchmarks --fresh
 """
 
 from __future__ import annotations
@@ -30,34 +41,35 @@ import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-import pytest
-
-from tests.benchmarks.longmemeval_evaluator import EvaluationResult, evaluate_answer
-from tests.benchmarks.longmemeval_utils import (
-    compute_accuracy,
-    compute_recall_at_k,
-    is_abstention,
-    load_dataset,
-)
-
-if TYPE_CHECKING:
-
-    from core.llm import LLMBackend
-
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from benchmarks.checkpoint import RESULTS_DIR, Checkpoint
+from benchmarks.cli import (
+    build_fingerprint,
+    dataset_question_ids,
+    get_git_info,
+    resolve_checkpoint,
+)
+from benchmarks.longmemeval_evaluator import EvaluationResult, evaluate_answer
+from benchmarks.longmemeval_utils import (
+    compute_accuracy,
+    compute_recall_at_k,
+    is_abstention,
+)
 from core.llm import LLMStructuredOutputError, PromptCachingConfig
+
+if TYPE_CHECKING:
+    from core.llm import LLMBackend
 
 logger = logging.getLogger(__name__)
 
 _NO_CACHE = PromptCachingConfig(enabled=False)
 """Explicit caching-disabled config for benchmark QA calls.
 
-Benchmark pytest processes never call ``init_settings()``, so leaving
+Benchmark processes never call ``init_settings()``, so leaving
 ``cache_config=None`` would make ``LLMBackend.chat()`` fall back to
 ``build_cache_config()`` → ``get_settings()`` → ``RuntimeError``.
 """
@@ -83,11 +95,6 @@ ENRICHMENT_POLL_INTERVAL_S: float = 2.0
 ENRICHMENT_TIMEOUT_S: int = 300
 """Maximum seconds to wait for enrichment to complete."""
 
-RESULTS_DIR: Path = (
-    Path(__file__).resolve().parent.parent.parent / "benchmarks" / "results"
-)
-"""Directory where timestamped benchmark result JSON files are stored."""
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Private helpers
@@ -102,9 +109,6 @@ _RETRYABLE_STATUSES: set[int] = {429, 502, 503, 504}
 # genuine multipart encoding with no file parts. Mirrors the SDK's
 # ``openzync._http._EMPTY_FILES`` sentinel.
 _EMPTY_FILES = iter(())
-
-#: Path for incremental progress saves (protects against partial data loss).
-_TMP_RESULTS_DIR: Path = RESULTS_DIR / ".in_progress"
 
 
 async def _request_with_retry(
@@ -206,9 +210,7 @@ async def _request_with_retry(
             request=last_exc.request,
             response=None,  # type: ignore[arg-type]
         ) from last_exc
-    raise RuntimeError(
-        f"Request failed after {max_retries} retries"
-    ) from last_exc
+    raise RuntimeError(f"Request failed after {max_retries} retries") from last_exc
 
 
 async def _login(client: httpx.AsyncClient) -> str:
@@ -225,12 +227,12 @@ async def _login(client: httpx.AsyncClient) -> str:
     email = os.environ.get("BENCH_EMAIL")
     password = os.environ.get("BENCH_PASSWORD")
     if not email or not password:
-        raise RuntimeError(
-            "BENCH_EMAIL and BENCH_PASSWORD must be set in environment"
-        )
+        raise RuntimeError("BENCH_EMAIL and BENCH_PASSWORD must be set in environment")
 
     resp = await _request_with_retry(
-        client, "POST", "/v1/auth/login",
+        client,
+        "POST",
+        "/v1/auth/login",
         json={"email": email, "password": password},
     )
     data: dict = resp.json()
@@ -258,7 +260,9 @@ async def _find_project_by_name(
     Only returns non-archived projects.
     """
     resp = await _request_with_retry(
-        client, "GET", "/v1/projects",
+        client,
+        "GET",
+        "/v1/projects",
         params={"limit": 200},
         headers=_auth_header(token),
     )
@@ -269,7 +273,10 @@ async def _find_project_by_name(
 
 
 async def _ensure_project(
-    client: httpx.AsyncClient, token: str, variant: str
+    client: httpx.AsyncClient,
+    token: str,
+    variant: str,
+    checkpoint: Checkpoint,
 ) -> tuple[str, bool]:
     """Get or create a persistent benchmark project.
 
@@ -279,6 +286,11 @@ async def _ensure_project(
     previous run before the naming convention was introduced).
 
     Resolution order:
+    0. Project id recorded in the checkpoint manifest (resumed runs) —
+       reused without ingestion only when the manifest's ``ingested``
+       flag is set; a manifest checkpointed mid-ingest re-runs ingest
+       into the same project (``is_new=True`` with the pinned id) so a
+       resume never queries partially-ingested data
     1. Look for project named ``longmemeval-benchmark-{variant}``
     2. Fall back to any non-archived project with ``"longmemeval"`` in name
     3. Create a new project with the deterministic name
@@ -287,23 +299,49 @@ async def _ensure_project(
         client: Authenticated HTTP client.
         token: JWT access token.
         variant: Dataset variant (``"s"``, ``"oracle"``, etc.).
+        checkpoint: Checkpoint manifest — supplies a known project id on
+            resume and records the resolved id for future resumes.
 
     Returns:
         A tuple of ``(project_id, is_new)`` where ``is_new`` is ``True``
-        if the project was just created (needs ingestion + enrichment).
+        if the project needs ingestion + enrichment (just created, or a
+        resumed manifest whose ingest never completed).
     """
+    # Priority 0: project id pinned by a resumed checkpoint manifest —
+    # no project listing needed. The ingested flag decides whether the
+    # data is complete: without it the run was killed mid-ingest and
+    # must re-ingest into the same project, not skip to querying.
+    if checkpoint.project_id is not None:
+        if checkpoint.ingested:
+            logger.info(
+                "Reusing project %s from checkpoint manifest — skipping lookup",
+                checkpoint.project_id,
+            )
+            return checkpoint.project_id, False
+        logger.warning(
+            "Checkpoint %s pins project %s but ingest never completed "
+            "(interrupted mid-ingest) — re-running ingest into the same "
+            "project instead of querying partial data",
+            checkpoint.path,
+            checkpoint.project_id,
+        )
+        return checkpoint.project_id, True
+
     project_name = f"{BENCHMARK_PROJECT_PREFIX}-{variant}"
 
     # Priority 1: exact match by name
     existing = await _find_project_by_name(client, token, project_name)
     if existing is not None:
         logger.info("Reusing project %s (%s)", project_name, existing)
+        checkpoint.set_project_id(existing)
         return existing, False
 
     # Priority 2: any non-archived project with "longmemeval" in its name
     # (catches legacy project names like longmemeval-1783604743)
     resp = await _request_with_retry(
-        client, "GET", "/v1/projects",
+        client,
+        "GET",
+        "/v1/projects",
         params={"limit": 200},
         headers=_auth_header(token),
     )
@@ -318,17 +356,21 @@ async def _ensure_project(
                 name,
                 pid,
             )
+            checkpoint.set_project_id(pid)
             return pid, False
 
     # Priority 3: create new
     resp = await _request_with_retry(
-        client, "POST", "/v1/projects",
+        client,
+        "POST",
+        "/v1/projects",
         json={"name": project_name},
         headers=_auth_header(token),
     )
     data: dict = resp.json()
     project_id = str(data["id"])
     logger.info("Created new project %s (%s)", project_name, project_id)
+    checkpoint.set_project_id(project_id)
     return project_id, True
 
 
@@ -348,7 +390,9 @@ async def _set_org_graph_backend(
         The updated org config response.
     """
     resp = await _request_with_retry(
-        client, "PATCH", "/admin/org/config",
+        client,
+        "PATCH",
+        "/admin/org/config",
         json={"graph_backend": graph_backend},
         headers=_auth_header(token),
     )
@@ -377,7 +421,9 @@ async def _create_session(
         The created session's UUID as a string.
     """
     resp = await _request_with_retry(
-        client, "POST", f"/v1/projects/{project_id}/sessions",
+        client,
+        "POST",
+        f"/v1/projects/{project_id}/sessions",
         json={"external_id": external_id},
         headers=_auth_header(token),
     )
@@ -421,7 +467,9 @@ async def _ingest_memory(
     # sentinel (mirrors the SDK's ``request_multipart``).
     try:
         await _request_with_retry(
-            client, "POST", f"/v1/projects/{project_id}/memory",
+            client,
+            "POST",
+            f"/v1/projects/{project_id}/memory",
             data={"data": json.dumps(body)},
             files=_EMPTY_FILES,
             headers=_auth_header(token),
@@ -459,9 +507,7 @@ async def _wait_for_enrichment(
     Raises:
         TimeoutError: If enrichment does not complete within the timeout.
     """
-    logger.info(
-        "Waiting 10s for worker to pick up enrichment tasks before polling..."
-    )
+    logger.info("Waiting 10s for worker to pick up enrichment tasks before polling...")
     await asyncio.sleep(10)
 
     deadline = time.monotonic() + ENRICHMENT_TIMEOUT_S
@@ -469,7 +515,9 @@ async def _wait_for_enrichment(
 
     while time.monotonic() < deadline:
         resp = await _request_with_retry(
-            client, "GET", "/metrics/summary",
+            client,
+            "GET",
+            "/metrics/summary",
             headers=_auth_header(token),
         )
         data: dict[str, Any] = resp.json()
@@ -528,7 +576,9 @@ async def _search(
         keys.
     """
     resp = await _request_with_retry(
-        client, "GET", f"/v1/projects/{project_id}/search",
+        client,
+        "GET",
+        f"/v1/projects/{project_id}/search",
         params={"query": query, "limit": limit, "types": "episodes,facts"},
         headers=_auth_header(token),
     )
@@ -556,7 +606,9 @@ async def _get_context(
         The assembled context text.
     """
     resp = await _request_with_retry(
-        client, "GET", f"/v1/projects/{project_id}/context",
+        client,
+        "GET",
+        f"/v1/projects/{project_id}/context",
         params={"query": query, "limit": limit, "format": "text"},
         headers=_auth_header(token),
     )
@@ -624,9 +676,7 @@ def _build_comparison_table(
     lines.append("| Category | Accuracy | Count |")
     lines.append("|----------|----------|-------|")
     for cat, stats in sorted(metrics_full.get("per_category", {}).items()):
-        lines.append(
-            f"| {cat} | {stats['accuracy']:.1%} | {stats['total']} |"
-        )
+        lines.append(f"| {cat} | {stats['accuracy']:.1%} | {stats['total']} |")
 
     return "\n".join(lines)
 
@@ -683,6 +733,7 @@ def _save_results(
     config: SimpleNamespace,
     git_commit: str | None,
     version: str | None,
+    checkpoint: Checkpoint,
     judge_model: str | None = None,
 ) -> Path:
     """Save benchmark results to a timestamped JSON file.
@@ -692,6 +743,9 @@ def _save_results(
         config: Benchmark configuration from CLI args.
         git_commit: Current git commit hash.
         version: OpenZync version string.
+        checkpoint: Checkpoint manifest of this run — its ``started_at``
+            stamps the output file, so a resumed run keeps the original
+            run's timestamp.
         judge_model: Judge backend model name for the config label.
             Falls back to ``NVIDIA_MODEL`` env (default NVIDIA model)
             when not provided.
@@ -699,7 +753,8 @@ def _save_results(
     Returns:
         Path to the saved results file.
     """
-    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    started_at = datetime.fromisoformat(checkpoint.started_at)
+    timestamp = started_at.strftime("%Y%m%d_%H%M%S")
     variant = config.variant or BENCHMARK_VARIANT
 
     # Compute aggregate metrics
@@ -725,9 +780,7 @@ def _save_results(
             "baseline_mode": config.baseline,
             "benchmark_limit": config.benchmark_limit,
             "llm_judge_model": judge_model
-            or os.environ.get(
-                "NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"
-            ),
+            or os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"),
             "judge_temperature": 0.0,
         },
         "metrics": metrics,
@@ -743,44 +796,6 @@ def _save_results(
 
     logger.info("Results saved to %s", filepath)
     return filepath
-
-
-def _get_git_info() -> tuple[str | None, str | None]:
-    """Attempt to read the current git commit hash and project version.
-
-    Returns:
-        A tuple of ``(git_commit_hash, project_version)``, each possibly
-        ``None`` if the information cannot be determined.
-    """
-    git_commit: str | None = None
-    version: str | None = None
-
-    try:
-        import subprocess  # noqa: S404 — intentional git metadata read
-
-        result = subprocess.run(  # noqa: S607
-            ["git", "rev-parse", "HEAD"],  # noqa: S607
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).resolve().parent.parent.parent,
-        )
-        if result.returncode == 0:
-            git_commit = result.stdout.strip()
-    except Exception:  # noqa: S110 — best-effort, safe to ignore
-        pass
-
-    try:
-        import tomllib  # Python 3.11+
-
-        pyproject = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
-        if pyproject.exists():
-            with open(pyproject, "rb") as f:
-                data = tomllib.load(f)
-            version = data.get("project", {}).get("version", None)
-    except Exception:  # noqa: S110 — best-effort, safe to ignore
-        pass
-
-    return git_commit, version
 
 
 def _flatten_messages(
@@ -815,92 +830,114 @@ def _flatten_messages(
             )
             continue
         for msg in session:
-            flat.append({
-                "role": msg.get("role", "user"),
-                "content": msg.get("content", ""),
-            })
+            flat.append(
+                {
+                    "role": msg.get("role", "user"),
+                    "content": msg.get("content", ""),
+                }
+            )
     return flat
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Benchmark test
+# Benchmark entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.benchmark
-@pytest.mark.asyncio
-async def test_longmemeval_benchmark(
-    openai_backend: LLMBackend,
-    benchmark_config: SimpleNamespace,
+async def run_benchmark(
+    cfg: SimpleNamespace,
+    llm_backend: LLMBackend,
     api_client: httpx.AsyncClient,
+    checkpoint: Checkpoint,
+    dataset: list[dict[str, Any]],
 ) -> None:
     """Run the LongMemEval benchmark end-to-end.
 
-    This test:
-    1. Loads the LongMemEval dataset
+    This entry point:
+    1. Uses the caller-supplied dataset (already limit-sliced by
+       ``cli.main`` — the single load for the whole run)
     2. Creates a project and ingests all conversations
     3. Waits for enrichment to complete
-    4. For each question: runs search (R@k) and context (LLM-judge QA)
+    4. For each question: runs search (R@k) and context (LLM-judge QA),
+       checkpointing after every question
     5. If ``--baseline``: repeats with graph backend disabled
     6. Saves results as timestamped JSON and prints a comparison table
 
     Args:
-        openai_backend: OpenAI LLM backend for answer evaluation.
-        benchmark_config: Parsed CLI options from the conftest.
+        cfg: Parsed CLI options — ``variant``, ``benchmark_limit``,
+            ``baseline``, and ``reranker``.
+        llm_backend: LLM backend for answer generation and judging.
         api_client: HTTP client configured with the benchmark API base URL.
+        checkpoint: Checkpoint manifest for the full-pipeline run.
+        dataset: LongMemEval question entries, already sliced to
+            ``cfg.benchmark_limit`` by the caller.
     """
-    variant = benchmark_config.variant or BENCHMARK_VARIANT
-    limit = benchmark_config.benchmark_limit
-
-    # ── Phase 0: Load dataset ──────────────────────────────────────────────
-    dataset = load_dataset(variant)
-    if limit and limit < len(dataset):
-        logger.info(
-            "Benchmark limit set to %d — using subset of %d questions",
-            limit,
-            len(dataset),
-        )
-        dataset = dataset[:limit]
+    variant = cfg.variant or BENCHMARK_VARIANT
+    limit = cfg.benchmark_limit
 
     logger.info(
         "Starting LongMemEval benchmark: %d questions, variant=%s",
         len(dataset),
         variant,
     )
+    question_ids = dataset_question_ids(dataset)
 
     # ── Phase 1: Authenticate ──────────────────────────────────────────────
     token = await _login(api_client)
     logger.info("Authenticated successfully")
 
     # ── Git metadata ───────────────────────────────────────────────────────
-    git_commit, version = _get_git_info()
+    git_commit, version = get_git_info()
 
     # ── Run full pipeline ──────────────────────────────────────────────────
     results_full = await _run_benchmark_pipeline(
         api_client=api_client,
         token=token,
         dataset=dataset,
-        openai_backend=openai_backend,
-        reranker=benchmark_config.reranker,
+        openai_backend=llm_backend,
+        reranker=cfg.reranker,
         variant=variant,
         label="full",
+        checkpoint=checkpoint,
     )
 
     # ── Run baseline (if requested) ────────────────────────────────────────
     results_baseline = None
-    if benchmark_config.baseline:
+    baseline_checkpoint: Checkpoint | None = None
+    if cfg.baseline:
         logger.info("Running baseline mode — disabling graph backend...")
         # Switch org config to disable graph backend
         await _set_org_graph_backend(api_client, token, graph_backend="none")
         try:
+            # Separate manifest (label "baseline") so the two runs never
+            # cross-resume — the fingerprint includes the label.
+            baseline_fingerprint = build_fingerprint(
+                variant=variant,
+                label="baseline",
+                reranker=False,
+                judge_model=llm_backend.model_name,
+                git_commit=git_commit,
+                question_ids=question_ids,
+                limit=limit,
+            )
+            # The user's --resume path (if any) names a full-run manifest
+            # and can never match the baseline fingerprint — resolving with
+            # the full cfg would die with exit 2 only AFTER the hours-long
+            # full pipeline above. Resolve by auto-discovery (or --fresh).
+            baseline_args = SimpleNamespace(resume=None, fresh=cfg.fresh)
+            baseline_checkpoint = resolve_checkpoint(
+                baseline_fingerprint, baseline_args
+            )
+            logger.info("Baseline checkpoint manifest: %s", baseline_checkpoint.path)
             results_baseline = await _run_benchmark_pipeline(
                 api_client=api_client,
                 token=token,
                 dataset=dataset,
-                openai_backend=openai_backend,
+                openai_backend=llm_backend,
                 reranker=False,
                 variant=f"{variant}-baseline",
                 label="baseline",
+                checkpoint=baseline_checkpoint,
             )
         finally:
             # Restore graph backend
@@ -932,30 +969,37 @@ async def test_longmemeval_benchmark(
     # Save results
     saved_path = _save_results(
         results_full,
-        benchmark_config,
+        cfg,
         git_commit,
         version,
-        judge_model=openai_backend.model_name,
+        checkpoint,
+        judge_model=llm_backend.model_name,
     )
-    if results_baseline:
+    if results_baseline and baseline_checkpoint is not None:
         base_config = SimpleNamespace(
-            run_benchmark=benchmark_config.run_benchmark,
-            benchmark_limit=benchmark_config.benchmark_limit,
+            benchmark_limit=cfg.benchmark_limit,
             baseline=False,
             reranker=False,
-            variant=benchmark_config.variant,
+            variant=cfg.variant,
         )
         baseline_path = _save_results(
             results_baseline,
             base_config,
             git_commit,
             version,
-            judge_model=openai_backend.model_name,
+            baseline_checkpoint,
+            judge_model=llm_backend.model_name,
         )
         # Rename to include _baseline suffix for clarity
         baseline_renamed = baseline_path.with_stem(baseline_path.stem + "_baseline")
         baseline_path.rename(baseline_renamed)
         logger.info("Baseline results saved to %s", baseline_renamed)
+
+    # Results are durable on disk — the manifests can now be closed out.
+    # They stay in .in_progress/ for audit (see Checkpoint.mark_completed).
+    checkpoint.mark_completed()
+    if baseline_checkpoint is not None:
+        baseline_checkpoint.mark_completed()
 
     # Print comparison table
     table = _build_comparison_table(metrics_full, metrics_baseline)
@@ -963,10 +1007,9 @@ async def test_longmemeval_benchmark(
     print("LongMemEval Benchmark Results")
     print("=" * 72)
     print(
-        f"Variant: {variant}  |  Questions: {len(dataset)}  "
-        f"|  Reranker: {benchmark_config.reranker}"
+        f"Variant: {variant}  |  Questions: {len(dataset)}  |  Reranker: {cfg.reranker}"
     )
-    if benchmark_config.baseline:
+    if cfg.baseline:
         print("Baseline (pure vector): included")
     print()
     print(table)
@@ -987,7 +1030,8 @@ async def _run_benchmark_pipeline(
     openai_backend: LLMBackend,
     reranker: bool,
     variant: str,
-    label: str = "run",
+    label: str,
+    checkpoint: Checkpoint,
 ) -> list[dict[str, Any]]:
     """Execute a single benchmark pipeline run (ingest → enrich → query).
 
@@ -1005,6 +1049,9 @@ async def _run_benchmark_pipeline(
         variant: Dataset variant (``"s"``, ``"oracle"``, etc.) — used
             to derive the persistent project name.
         label: Short label for logging (e.g. ``"full"``, ``"baseline"``).
+        checkpoint: Checkpoint manifest for this run — supplies the
+            resumed project id, the set of already-answered questions,
+            and the per-question incremental persistence.
 
     Returns:
         List of per-question result dicts with keys: ``id``, ``question``,
@@ -1012,7 +1059,7 @@ async def _run_benchmark_pipeline(
         ``context``, ``model_answer``.
     """
     # ── Get or create persistent project ──────────────────────────────────
-    project_id, is_new = await _ensure_project(api_client, token, variant)
+    project_id, is_new = await _ensure_project(api_client, token, variant, checkpoint)
 
     if is_new:
         # ── Ingest all conversations ───────────────────────────────────────────
@@ -1046,7 +1093,10 @@ async def _run_benchmark_pipeline(
             for i in range(0, len(messages), batch_size):
                 batch = messages[i : i + batch_size]
                 await _ingest_memory(
-                    api_client, token, project_id, batch,
+                    api_client,
+                    token,
+                    project_id,
+                    batch,
                     session_external_id=session_external_id,
                 )
                 ingested_count += len(batch)
@@ -1067,6 +1117,11 @@ async def _run_benchmark_pipeline(
                 "[%s] Enrichment timed out — proceeding with partial data",
                 label,
             )
+        # Ingest phase is done (all messages sent, enrichment waited out):
+        # persist immediately so a resume never mistakes this project for
+        # mid-ingest partial data. Set even after a timeout — the timeout
+        # path knowingly proceeds to querying today.
+        checkpoint.mark_ingested()
     else:
         logger.info(
             "[%s] Project %s already has data — skipping ingestion + enrichment",
@@ -1075,15 +1130,35 @@ async def _run_benchmark_pipeline(
         )
 
     # ── Query each question ────────────────────────────────────────────
-    results: list[dict[str, Any]] = []
+    question_ids = dataset_question_ids(dataset)
+    completed = checkpoint.completed_ids()
+    if completed:
+        logger.info(
+            "[%s] Resuming from checkpoint %s — %d/%d questions complete",
+            label,
+            checkpoint.path,
+            len(completed),
+            len(dataset),
+        )
+    # Previously completed results lead the list so the running accuracy
+    # and the saved file cover the whole run, not just this process.
+    results: list[dict[str, Any]] = list(checkpoint.results)
     for idx, entry in enumerate(dataset):
         question = entry.get("question", "")
-        question_id = entry.get("question_id", str(idx))
+        question_id = question_ids[idx]
         # The LongMemEval-S dataset uses key "answer"; the oracle variant
         # uses "expected_answer".  Try both for compatibility.
         expected_answer = entry.get("answer", entry.get("expected_answer", ""))
         qtype = entry.get("question_type", "unknown")
         abstention = is_abstention(question_id)
+
+        if question_id in completed:
+            logger.info(
+                "[%s] Skipping %s — already complete in checkpoint",
+                label,
+                question_id,
+            )
+            continue
 
         logger.info(
             "[%s] Query %d/%d: %s",
@@ -1165,18 +1240,9 @@ async def _run_benchmark_pipeline(
             f"\n    Running: {correct_so_far}/{total_so_far} ({running_acc:.1f}%)"
         )
 
-        # Incremental save every 10 questions to protect against data loss
-        if (idx + 1) % 10 == 0:
-            _TMP_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            tmp_path = _TMP_RESULTS_DIR / f"{label}_partial_{idx+1}.json"
-            with open(tmp_path, "w") as f:
-                json.dump(results, f, indent=2, default=str)
-            logger.info(
-                "[%s] Progress: %d/%d questions — saved partial results to %s",
-                label,
-                idx + 1,
-                len(dataset),
-                tmp_path,
-            )
+        # Checkpoint after EVERY question — the manifest (not the old
+        # write-only partial files) is the resume point for a rerun.
+        checkpoint.append_result(result_entry)
+        checkpoint.save()
 
     return results

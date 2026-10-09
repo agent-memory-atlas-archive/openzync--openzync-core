@@ -86,9 +86,13 @@ test-integration:
 
 # ── Benchmarks ─────────────────────────────────────────────────────────────────
 # Run the LongMemEval benchmark (requires live OpenZync instance + LLM API key).
+# Runs are checkpointed after every question — an interrupted run auto-resumes
+# from the newest matching manifest in benchmarks/results/.in_progress/.
 # Options:  make benchmark ARGS="--benchmark-limit=10 --baseline --reranker"
+#           --fresh (ignore checkpoints, start over)
+#           --resume PATH (resume one explicit manifest)
 benchmark:
-	.venv/bin/python -m pytest tests/benchmarks/ --run-benchmark -v $(ARGS)
+	.venv/bin/python -m benchmarks $(ARGS)
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
