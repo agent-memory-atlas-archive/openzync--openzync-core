@@ -88,6 +88,7 @@ test-integration:
 # Run the LongMemEval benchmark (requires live OpenZync instance + LLM API key).
 # Runs are checkpointed after every question — an interrupted run auto-resumes
 # from the newest matching manifest in benchmarks/results/.in_progress/.
+# Query-only by default (reuses pre-ingested project data); pass --ingest to permit ingestion.
 # Options:  make benchmark ARGS="--benchmark-limit=10 --baseline --reranker"
 #           --fresh (ignore checkpoints, start over)
 #           --resume PATH (resume one explicit manifest)

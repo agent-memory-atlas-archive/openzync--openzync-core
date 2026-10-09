@@ -1,14 +1,22 @@
 """LongMemEval benchmark — measures retrieval quality and QA accuracy.
 
-This harness ingests LongMemEval conversations into a live OpenZync
-instance, waits for asynchronous enrichment, queries the search and
-context endpoints, and evaluates both R@k (recall at k) and end-to-end
-QA accuracy.  Every question is checkpointed, so an interrupted run
-resumes instead of restarting.
+This harness queries a live OpenZync instance whose data is already
+ingested and enriched outside the harness, waits for no enrichment by
+default, runs the search and context endpoints, and evaluates both R@k
+(recall at k) and end-to-end QA accuracy.  Every question is
+checkpointed, so an interrupted run resumes instead of restarting.
+
+The harness is query-only by default: it reuses a project that already
+holds data and raises ``BenchmarkConfigError`` (exit 2) instead of
+ingesting when ingestion would be required.  Pass ``--ingest`` to permit
+ingesting dataset conversations into a new or empty project.
 
 Usage:
-    # Full run (default variant 's', no baseline, no reranker):
+    # Query-only run against pre-ingested data (default):
     python -m benchmarks
+
+    # Permit ingestion into a new or empty project:
+    python -m benchmarks --ingest
 
     # Quick run (10 questions):
     python -m benchmarks --benchmark-limit 10
@@ -48,6 +56,7 @@ import httpx
 
 from benchmarks.checkpoint import RESULTS_DIR, Checkpoint
 from benchmarks.cli import (
+    BenchmarkConfigError,
     build_fingerprint,
     dataset_question_ids,
     get_git_info,
@@ -272,28 +281,76 @@ async def _find_project_by_name(
     return None
 
 
+async def _project_has_sessions(
+    client: httpx.AsyncClient, token: str, project_id: str
+) -> bool:
+    """Check whether a project holds any sessions.
+
+    Presence guard for query-only mode: a found project is trusted as
+    complete only when it is non-empty.
+
+    Args:
+        client: Authenticated HTTP client.
+        token: JWT access token.
+        project_id: Project UUID to probe.
+
+    Returns:
+        True when at least one session exists, False otherwise.
+    """
+    resp = await _request_with_retry(
+        client,
+        "GET",
+        f"/v1/projects/{project_id}/sessions",
+        params={"limit": 1},
+        headers=_auth_header(token),
+    )
+    payload: Any = resp.json()
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        raw_items = payload.get("items", [])
+        items = raw_items if isinstance(raw_items, list) else []
+    else:
+        items = []
+    return len(items) > 0
+
+
 async def _ensure_project(
     client: httpx.AsyncClient,
     token: str,
     variant: str,
     checkpoint: Checkpoint,
+    allow_ingest: bool,
 ) -> tuple[str, bool]:
     """Get or create a persistent benchmark project.
 
-    Reuses existing project data (from earlier benchmark runs) to avoid
-    re-ingesting conversations.  Falls back to any project whose name
-    contains ``"longmemeval"`` (e.g. ``longmemeval-1783604743`` from a
-    previous run before the naming convention was introduced).
+    The harness is query-only by default: backend data is fully
+    ingested/enriched and managed outside the harness, so ingestion runs
+    only when ``allow_ingest`` (``--ingest``) is set.  Without the flag
+    every branch that would require ingestion raises
+    ``BenchmarkConfigError`` instead of ingesting or skipping silently.
 
     Resolution order:
     0. Project id recorded in the checkpoint manifest (resumed runs) —
        reused without ingestion only when the manifest's ``ingested``
        flag is set; a manifest checkpointed mid-ingest re-runs ingest
-       into the same project (``is_new=True`` with the pinned id) so a
-       resume never queries partially-ingested data
-    1. Look for project named ``longmemeval-benchmark-{variant}``
-    2. Fall back to any non-archived project with ``"longmemeval"`` in name
-    3. Create a new project with the deterministic name
+       into the same project (``is_new=True`` with the pinned id) when
+       ``allow_ingest``, else raises naming the manifest path and the
+       project id (re-run WITH ``--ingest`` to complete ingestion, or
+       ``--fresh`` to start over)
+    1. Look for project named ``longmemeval-benchmark-{variant}`` —
+       non-empty projects are trusted as complete (``is_new=False``);
+       empty projects raise without the flag, or ingest into the pinned
+       existing id with the flag
+    2. Fall back to any non-archived project with ``"longmemeval"`` in
+       name — same empty/non-empty rules as priority 1
+    3. Create a new project with the deterministic name — raises naming
+       ``longmemeval-benchmark-{variant}`` without the flag, creates
+       with it (``is_new=True``)
+
+    In no-flag mode the operator asserts pre-existing project data is
+    complete — the harness trusts a non-empty project without verifying
+    per-entry coverage.
 
     Args:
         client: Authenticated HTTP client.
@@ -301,11 +358,18 @@ async def _ensure_project(
         variant: Dataset variant (``"s"``, ``"oracle"``, etc.).
         checkpoint: Checkpoint manifest — supplies a known project id on
             resume and records the resolved id for future resumes.
+        allow_ingest: Whether ingestion is permitted (``--ingest``).
+            False makes every ingestion-requiring branch a hard error.
 
     Returns:
         A tuple of ``(project_id, is_new)`` where ``is_new`` is ``True``
-        if the project needs ingestion + enrichment (just created, or a
-        resumed manifest whose ingest never completed).
+        if the project needs ingestion + enrichment (just created, an
+        empty pre-existing project ingested into with the flag, or a
+        resumed manifest whose ingest never completed with the flag).
+
+    Raises:
+        BenchmarkConfigError: If ingestion would be required but
+            ``allow_ingest`` is False.
     """
     # Priority 0: project id pinned by a resumed checkpoint manifest —
     # no project listing needed. The ingested flag decides whether the
@@ -318,6 +382,13 @@ async def _ensure_project(
                 checkpoint.project_id,
             )
             return checkpoint.project_id, False
+        if not allow_ingest:
+            raise BenchmarkConfigError(
+                f"Checkpoint {checkpoint.path} pins project "
+                f"{checkpoint.project_id} but ingest never completed for "
+                "this project — re-run WITH --ingest to complete ingestion "
+                "(or --fresh to start over)."
+            )
         logger.warning(
             "Checkpoint %s pins project %s but ingest never completed "
             "(interrupted mid-ingest) — re-running ingest into the same "
@@ -332,9 +403,36 @@ async def _ensure_project(
     # Priority 1: exact match by name
     existing = await _find_project_by_name(client, token, project_name)
     if existing is not None:
-        logger.info("Reusing project %s (%s)", project_name, existing)
+        if await _project_has_sessions(client, token, existing):
+            logger.warning(
+                "Reusing project %s (%s) — trusting pre-existing data, "
+                "completeness is operator-managed",
+                project_name,
+                existing,
+            )
+            checkpoint.set_project_id(existing)
+            # ⚠️ Deliberate residual hole: --fresh on a partial project
+            # re-trusts it here. Closed fully only by future per-entry
+            # ingest tracking.
+            # REQUIRED: without this, every questioning-phase kill on a
+            # pre-existing project resumes with ingested=False and hits
+            # the priority-0 hard error above.
+            checkpoint.mark_ingested()
+            return existing, False
+        if not allow_ingest:
+            raise BenchmarkConfigError(
+                f"Project {project_name} ({existing}) exists but holds no "
+                "sessions — ingestion would be required. Re-run WITH "
+                "--ingest to ingest into it."
+            )
+        logger.warning(
+            "Project %s (%s) exists but is empty — ingesting into the "
+            "existing project (zero sessions, no conflict risk)",
+            project_name,
+            existing,
+        )
         checkpoint.set_project_id(existing)
-        return existing, False
+        return existing, True
 
     # Priority 2: any non-archived project with "longmemeval" in its name
     # (catches legacy project names like longmemeval-1783604743)
@@ -351,15 +449,43 @@ async def _ensure_project(
         name = project.get("name", "")
         if "longmemeval" in name.lower():
             pid = str(project["id"])
-            logger.info(
-                "Reusing existing project %s (%s) — skipping ingest",
+            if await _project_has_sessions(client, token, pid):
+                logger.warning(
+                    "Reusing existing project %s (%s) — trusting "
+                    "pre-existing data, completeness is operator-managed",
+                    name,
+                    pid,
+                )
+                checkpoint.set_project_id(pid)
+                # ⚠️ Deliberate residual hole: --fresh on a partial
+                # project re-trusts it here. Closed fully only by future
+                # per-entry ingest tracking.
+                # REQUIRED: without this, every questioning-phase kill on
+                # a pre-existing project resumes with ingested=False and
+                # hits the priority-0 hard error above.
+                checkpoint.mark_ingested()
+                return pid, False
+            if not allow_ingest:
+                raise BenchmarkConfigError(
+                    f"Project {name} ({pid}) exists but holds no sessions "
+                    "— ingestion would be required. Re-run WITH --ingest "
+                    "to ingest into it."
+                )
+            logger.warning(
+                "Project %s (%s) exists but is empty — ingesting into the "
+                "existing project (zero sessions, no conflict risk)",
                 name,
                 pid,
             )
             checkpoint.set_project_id(pid)
-            return pid, False
+            return pid, True
 
     # Priority 3: create new
+    if not allow_ingest:
+        raise BenchmarkConfigError(
+            f"Project {project_name} not found — ingestion would be "
+            "required. Re-run WITH --ingest to create and ingest it."
+        )
     resp = await _request_with_retry(
         client,
         "POST",
@@ -856,8 +982,9 @@ async def run_benchmark(
     This entry point:
     1. Uses the caller-supplied dataset (already limit-sliced by
        ``cli.main`` — the single load for the whole run)
-    2. Creates a project and ingests all conversations
-    3. Waits for enrichment to complete
+    2. Resolves the persistent project query-only by default (ingests
+       only with ``--ingest``)
+    3. Waits for enrichment to complete (ingest path only)
     4. For each question: runs search (R@k) and context (LLM-judge QA),
        checkpointing after every question
     5. If ``--baseline``: repeats with graph backend disabled
@@ -865,7 +992,7 @@ async def run_benchmark(
 
     Args:
         cfg: Parsed CLI options — ``variant``, ``benchmark_limit``,
-            ``baseline``, and ``reranker``.
+            ``baseline``, ``reranker``, and ``ingest``.
         llm_backend: LLM backend for answer generation and judging.
         api_client: HTTP client configured with the benchmark API base URL.
         checkpoint: Checkpoint manifest for the full-pipeline run.
@@ -899,6 +1026,7 @@ async def run_benchmark(
         variant=variant,
         label="full",
         checkpoint=checkpoint,
+        allow_ingest=cfg.ingest,
     )
 
     # ── Run baseline (if requested) ────────────────────────────────────────
@@ -938,6 +1066,7 @@ async def run_benchmark(
                 variant=f"{variant}-baseline",
                 label="baseline",
                 checkpoint=baseline_checkpoint,
+                allow_ingest=cfg.ingest,
             )
         finally:
             # Restore graph backend
@@ -1032,13 +1161,14 @@ async def _run_benchmark_pipeline(
     variant: str,
     label: str,
     checkpoint: Checkpoint,
+    allow_ingest: bool,
 ) -> list[dict[str, Any]]:
-    """Execute a single benchmark pipeline run (ingest → enrich → query).
+    """Execute a single benchmark pipeline run (resolve → query, ingest if allowed).
 
-    Uses a persistent project (``longmemeval-benchmark-{variant}``) so
-    enriched data survives across runs.  On the first run it creates the
-    project and ingests conversations; on subsequent runs it reuses the
-    existing enriched data and skips straight to querying.
+    Uses a persistent project (``longmemeval-benchmark-{variant}``) whose
+    data is managed outside the harness. Query-only by default: existing
+    non-empty projects are trusted as complete and queried directly;
+    ingestion runs only when ``allow_ingest`` (``--ingest``) permits it.
 
     Args:
         api_client: Authenticated HTTP client.
@@ -1052,15 +1182,24 @@ async def _run_benchmark_pipeline(
         checkpoint: Checkpoint manifest for this run — supplies the
             resumed project id, the set of already-answered questions,
             and the per-question incremental persistence.
+        allow_ingest: Whether ingestion is permitted (``--ingest``).
 
     Returns:
         List of per-question result dicts with keys: ``id``, ``question``,
         ``question_type``, ``correct``, ``reasoning``, ``r1``, ``r5``, ``r10``,
         ``context``, ``model_answer``.
+
+    Raises:
+        BenchmarkConfigError: If ingestion would be required but
+            ``allow_ingest`` is False.
     """
     # ── Get or create persistent project ──────────────────────────────────
-    project_id, is_new = await _ensure_project(api_client, token, variant, checkpoint)
+    project_id, is_new = await _ensure_project(
+        api_client, token, variant, checkpoint, allow_ingest
+    )
 
+    # Invariant: is_new is True only when --ingest was passed — every
+    # ingestion-requiring branch in _ensure_project raises without it.
     if is_new:
         # ── Ingest all conversations ───────────────────────────────────────────
         # Each dataset entry gets its own session so retrieval is measured

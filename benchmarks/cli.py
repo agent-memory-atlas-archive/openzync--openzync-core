@@ -90,7 +90,8 @@ def parse_args(argv: Sequence[str] | None = None) -> SimpleNamespace:
 
     Returns:
         A ``SimpleNamespace`` with ``variant``, ``benchmark_limit``,
-        ``baseline``, ``reranker``, ``resume``, ``fresh``, and ``base_url``.
+        ``baseline``, ``reranker``, ``resume``, ``fresh``, ``base_url``,
+        and ``ingest``.
     """
     parser = argparse.ArgumentParser(
         prog="python -m benchmarks",
@@ -151,6 +152,16 @@ def parse_args(argv: Sequence[str] | None = None) -> SimpleNamespace:
             "(default: $OPENZYNC_BASE_URL or http://localhost:8000)"
         ),
     )
+    parser.add_argument(
+        "--ingest",
+        action="store_true",
+        default=False,
+        help=(
+            "Permit ingesting dataset conversations into a new or empty "
+            "project. Without it the harness is query-only and errors if "
+            "ingestion would be required."
+        ),
+    )
     parsed = parser.parse_args(argv)
     return SimpleNamespace(
         variant=parsed.variant,
@@ -160,6 +171,7 @@ def parse_args(argv: Sequence[str] | None = None) -> SimpleNamespace:
         resume=parsed.resume,
         fresh=parsed.fresh,
         base_url=parsed.base_url,
+        ingest=parsed.ingest,
     )
 
 
