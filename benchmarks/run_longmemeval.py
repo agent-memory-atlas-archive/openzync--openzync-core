@@ -1,9 +1,9 @@
-"""LongMemEval benchmark — measures retrieval quality and QA accuracy.
+"""LongMemEval benchmark — measures retrieval quality.
 
 This harness queries a live OpenZync instance whose data is already
 ingested and enriched outside the harness, waits for no enrichment by
 default, runs the search and context endpoints, and evaluates both R@k
-(recall at k) and end-to-end QA accuracy.  Every question is
+(recall at k) and retrieval-judge accuracy. Every question is
 checkpointed, so an interrupted run resumes instead of restarting.
 
 The harness is query-only by default: it reuses a project that already
@@ -26,6 +26,9 @@ Usage:
 
     # With reranker enabled:
     python -m benchmarks --reranker
+
+    # Judge 8 questions concurrently (same LLM cost, shorter wall-clock):
+    python -m benchmarks --workers 8
 
     # Oracle variant:
     python -m benchmarks --variant oracle
@@ -54,6 +57,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from benchmarks import display
 from benchmarks.checkpoint import RESULTS_DIR, Checkpoint
 from benchmarks.cli import (
     BenchmarkConfigError,
@@ -62,26 +66,18 @@ from benchmarks.cli import (
     get_git_info,
     resolve_checkpoint,
 )
-from benchmarks.longmemeval_evaluator import EvaluationResult, evaluate_answer
+from benchmarks.longmemeval_evaluator import EvaluationResult, evaluate_retrieval
 from benchmarks.longmemeval_utils import (
     compute_accuracy,
     compute_recall_at_k,
     is_abstention,
 )
-from core.llm import LLMStructuredOutputError, PromptCachingConfig
+from core.llm import LLMStructuredOutputError
 
 if TYPE_CHECKING:
     from core.llm import LLMBackend
 
 logger = logging.getLogger(__name__)
-
-_NO_CACHE = PromptCachingConfig(enabled=False)
-"""Explicit caching-disabled config for benchmark QA calls.
-
-Benchmark processes never call ``init_settings()``, so leaving
-``cache_config=None`` would make ``LLMBackend.chat()`` fall back to
-``build_cache_config()`` → ``get_settings()`` → ``RuntimeError``.
-"""
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -287,7 +283,9 @@ async def _project_has_sessions(
     """Check whether a project holds any sessions.
 
     Presence guard for query-only mode: a found project is trusted as
-    complete only when it is non-empty.
+    complete only when it is non-empty. Closed sessions count because
+    their episodes/facts remain retrievable, and the dashboard passes
+    the same ``include_closed`` flag — do not drop it to "simplify".
 
     Args:
         client: Authenticated HTTP client.
@@ -301,14 +299,14 @@ async def _project_has_sessions(
         client,
         "GET",
         f"/v1/projects/{project_id}/sessions",
-        params={"limit": 1},
+        params={"limit": 1, "include_closed": "true"},
         headers=_auth_header(token),
     )
     payload: Any = resp.json()
     if isinstance(payload, list):
         items = payload
     elif isinstance(payload, dict):
-        raw_items = payload.get("items", [])
+        raw_items = payload.get("data", payload.get("items", []))
         items = raw_items if isinstance(raw_items, list) else []
     else:
         items = []
@@ -742,116 +740,149 @@ async def _get_context(
     return str(data.get("context", ""))
 
 
-def _build_comparison_table(
+def build_comparison_rows(
     metrics_full: dict[str, Any],
     metrics_baseline: dict[str, Any] | None,
-) -> str:
-    """Build a markdown comparison table of benchmark results.
+    *,
+    reranker: bool,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Build plain-data comparison rows for the benchmark results report.
 
-    Compare OpenZync scores against published Graphiti and Mem0 numbers.
+    Same numbers and strings the old markdown table carried —
+    percentages pre-formatted (``"62.5%"``), reference rows identical.
+    Presentation (rich tables) lives in ``benchmarks.display``; this
+    function only shapes the data.
+
+    The baseline row is emitted if and only if ``metrics_baseline`` was
+    provided AND contains a non-``None`` ``overall_accuracy`` — a bare
+    ``{}`` or a dict without accuracy yields no baseline row.
 
     Reference numbers (published):
-        - Graphiti LongMemEval-S: 83%
-        - Graphiti LoCoMo: 93%
-        - Mem0 LongMemEval: ~49%
+        - Zep LongMemEval-S: 90.2% (451/500)
+        - Zep LoCoMo: 94.7%
+        - Mem0 LongMemEval: 94.4% (new algorithm; old: 67.8%)
+
+    Sources, verified 2026-10-10:
+        - https://www.getzep.com/research/
+        - https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm
+
+    These are vendor-published figures, measured with differing
+    judge/reader stacks — not apples-to-apples with each other or with
+    this harness's own numbers.
 
     Args:
         metrics_full: Results dict from the full pipeline run.
         metrics_baseline: Optional results dict from the baseline run.
+        reranker: Whether the reranker was enabled — gates the
+            ``", RRF + reranker"`` suffix on the full-pipeline
+            conditions string.
 
     Returns:
-        A markdown-formatted comparison table.
+        A ``(system_rows, category_rows)`` pair. System rows carry keys
+        ``system``, ``accuracy``, ``r1``, ``r5``, ``r10``,
+        ``conditions``; category rows carry ``category``, ``accuracy``,
+        ``count`` — all values pre-formatted strings. Malformed
+        per-category entries are skipped with a warning, never a
+        ``KeyError``.
     """
-    accuracy_full = metrics_full.get("overall_accuracy", 0.0)
     accuracy_baseline = (
-        metrics_baseline.get("overall_accuracy", 0.0) if metrics_baseline else None
+        metrics_baseline.get("overall_accuracy") if metrics_baseline else None
     )
 
-    lines = [
-        "| System | Accuracy | R@1 | R@5 | R@10 | Conditions |",
-        "|--------|----------|-----|-----|------|------------|",
+    system_rows = [
+        {
+            "system": "OpenZync (full)",
+            "accuracy": f"{metrics_full.get('overall_accuracy', 0.0):.1%}",
+            "r1": f"{metrics_full.get('r1', 0):.1%}",
+            "r5": f"{metrics_full.get('r5', 0):.1%}",
+            "r10": f"{metrics_full.get('r10', 0):.1%}",
+            "conditions": (
+                "LongMemEval-S, RRF + reranker" if reranker else "LongMemEval-S"
+            ),
+        }
     ]
 
-    # OpenZync full pipeline
-    lines.append(
-        f"| OpenZync (full) | {accuracy_full:.1%} | "
-        f"{metrics_full.get('r1', 0):.1%} | "
-        f"{metrics_full.get('r5', 0):.1%} | "
-        f"{metrics_full.get('r10', 0):.1%} | "
-        f"LongMemEval-S, RRF + reranker |"
-    )
-
     # OpenZync baseline (if available)
-    if accuracy_baseline is not None:
-        lines.append(
-            f"| OpenZync (baseline) | {accuracy_baseline:.1%} | "
-            f"{metrics_baseline.get('r1', 0):.1%} | "
-            f"{metrics_baseline.get('r5', 0):.1%} | "
-            f"{metrics_baseline.get('r10', 0):.1%} | "
-            f"Pure vector only |"
+    if accuracy_baseline is not None and metrics_baseline is not None:
+        system_rows.append(
+            {
+                "system": "OpenZync (baseline)",
+                "accuracy": f"{accuracy_baseline:.1%}",
+                "r1": f"{metrics_baseline.get('r1', 0):.1%}",
+                "r5": f"{metrics_baseline.get('r5', 0):.1%}",
+                "r10": f"{metrics_baseline.get('r10', 0):.1%}",
+                "conditions": "Pure vector only",
+            }
         )
 
     # Published reference numbers
-    lines.append("| Graphiti | 83% | — | — | — | LongMemEval-S |")
-    lines.append("| Graphiti | 93% | — | — | — | LoCoMo |")
-    lines.append("| Mem0 | ~49% | — | — | — | LongMemEval |")
-
-    # Per-category breakdown
-    lines.append("")
-    lines.append("### Per-Category Accuracy")
-    lines.append("| Category | Accuracy | Count |")
-    lines.append("|----------|----------|-------|")
-    for cat, stats in sorted(metrics_full.get("per_category", {}).items()):
-        lines.append(f"| {cat} | {stats['accuracy']:.1%} | {stats['total']} |")
-
-    return "\n".join(lines)
-
-
-async def _answer_from_context(
-    backend: LLMBackend,
-    question: str,
-    context: str,
-    is_abstention: bool,
-) -> str:
-    """Generate an answer from retrieved context using the LLM.
-
-    Args:
-        backend: LLM backend for answer generation (same as judge backend).
-        question: The user's question.
-        context: Retrieved context text from OpenZync.
-        is_abstention: Whether the question expects abstention (i.e., the
-            model should say it doesn't know if the info isn't in context).
-
-    Returns:
-        The generated answer string.
-    """
-    system_prompt = (
-        "You are a precise question-answering assistant. Answer the question "
-        "using ONLY the information provided in the context below. "
-        "If the context does not contain enough information to answer the "
-        "question, respond with: 'I cannot answer this question based on the "
-        "available information.' Do NOT make up or infer information."
+    system_rows.append(
+        {
+            "system": "Zep",
+            "accuracy": "90.2%",
+            "r1": "—",
+            "r5": "—",
+            "r10": "—",
+            "conditions": "LongMemEval-S, reader gpt-5.4, cross-encoder",
+        }
     )
-    if is_abstention:
-        system_prompt += (
-            "\n\nThis is an abstention question. If the context does not "
-            "contain the answer, you MUST say you don't know. Do not guess."
+    system_rows.append(
+        {
+            "system": "Zep",
+            "accuracy": "94.7%",
+            "r1": "—",
+            "r5": "—",
+            "r10": "—",
+            "conditions": "LoCoMo",
+        }
+    )
+    system_rows.append(
+        {
+            "system": "Mem0",
+            "accuracy": "94.4%",
+            "r1": "—",
+            "r5": "—",
+            "r10": "—",
+            "conditions": "LongMemEval, new algorithm (old: 67.8%)",
+        }
+    )
+
+    # Per-category breakdown — malformed entries are skipped with a
+    # warning so one bad entry cannot KeyError a finished run.
+    category_rows: list[dict[str, str]] = []
+    per_category = metrics_full.get("per_category", {})
+    if not isinstance(per_category, dict):
+        logger.warning(
+            "skipping per_category breakdown: expected dict, got %s",
+            type(per_category).__name__,
         )
+    else:
+        for cat, stats in sorted(per_category.items()):
+            if not isinstance(stats, dict):
+                logger.warning(
+                    "skipping malformed per_category entry %r: expected dict, got %s",
+                    cat,
+                    type(stats).__name__,
+                )
+                continue
+            accuracy = stats.get("accuracy")
+            total = stats.get("total")
+            if accuracy is None or total is None:
+                logger.warning(
+                    "skipping malformed per_category entry %r: "
+                    "missing 'accuracy' or 'total'",
+                    cat,
+                )
+                continue
+            category_rows.append(
+                {
+                    "category": cat,
+                    "accuracy": f"{accuracy:.1%}",
+                    "count": str(total),
+                }
+            )
 
-    user_prompt = f"Context:\n{context}\n\nQuestion: {question}"
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    response = await backend.chat(
-        messages=messages,
-        temperature=0.0,
-        max_tokens=512,
-        cache_config=_NO_CACHE,
-    )
-    return response.content
+    return system_rows, category_rows
 
 
 def _save_results(
@@ -985,15 +1016,16 @@ async def run_benchmark(
     2. Resolves the persistent project query-only by default (ingests
        only with ``--ingest``)
     3. Waits for enrichment to complete (ingest path only)
-    4. For each question: runs search (R@k) and context (LLM-judge QA),
-       checkpointing after every question
+    4. For each question: runs search (R@k) and judges the retrieved
+       context directly against ground truth, checkpointing after every
+       question
     5. If ``--baseline``: repeats with graph backend disabled
     6. Saves results as timestamped JSON and prints a comparison table
 
     Args:
         cfg: Parsed CLI options — ``variant``, ``benchmark_limit``,
-            ``baseline``, ``reranker``, and ``ingest``.
-        llm_backend: LLM backend for answer generation and judging.
+            ``baseline``, ``reranker``, ``ingest``, and ``workers``.
+        llm_backend: LLM backend for retrieval judging.
         api_client: HTTP client configured with the benchmark API base URL.
         checkpoint: Checkpoint manifest for the full-pipeline run.
         dataset: LongMemEval question entries, already sliced to
@@ -1016,6 +1048,20 @@ async def run_benchmark(
     # ── Git metadata ───────────────────────────────────────────────────────
     git_commit, version = get_git_info()
 
+    # ── Run header (once per invocation — no second header for baseline) ──
+    resumed_ids = checkpoint.completed_ids()
+    display.print_run_header(
+        variant=variant,
+        limit=limit,
+        reranker=cfg.reranker,
+        baseline=cfg.baseline,
+        judge_model=llm_backend.model_name,
+        manifest_path=checkpoint.path,
+        resumed=bool(resumed_ids),
+        completed_count=len(resumed_ids),
+        total_count=len(dataset),
+    )
+
     # ── Run full pipeline ──────────────────────────────────────────────────
     results_full = await _run_benchmark_pipeline(
         api_client=api_client,
@@ -1027,6 +1073,7 @@ async def run_benchmark(
         label="full",
         checkpoint=checkpoint,
         allow_ingest=cfg.ingest,
+        workers=cfg.workers,
     )
 
     # ── Run baseline (if requested) ────────────────────────────────────────
@@ -1067,6 +1114,7 @@ async def run_benchmark(
                 label="baseline",
                 checkpoint=baseline_checkpoint,
                 allow_ingest=cfg.ingest,
+                workers=cfg.workers,
             )
         finally:
             # Restore graph backend
@@ -1130,26 +1178,121 @@ async def run_benchmark(
     if baseline_checkpoint is not None:
         baseline_checkpoint.mark_completed()
 
-    # Print comparison table
-    table = _build_comparison_table(metrics_full, metrics_baseline)
-    print("\n" + "=" * 72)
-    print("LongMemEval Benchmark Results")
-    print("=" * 72)
-    print(
-        f"Variant: {variant}  |  Questions: {len(dataset)}  |  Reranker: {cfg.reranker}"
+    # Print comparison report (stdout; logging on stderr is untouched)
+    system_rows, category_rows = build_comparison_rows(
+        metrics_full, metrics_baseline, reranker=cfg.reranker
     )
-    if cfg.baseline:
-        print("Baseline (pure vector): included")
-    print()
-    print(table)
-    print()
-    print(f"Results saved to: {saved_path}")
-    print("=" * 72)
+    display.print_results(
+        system_rows=system_rows,
+        category_rows=category_rows,
+        saved_path=saved_path,
+        manifest_path=checkpoint.path,
+        judge_errors=metrics_full["judge_errors"],
+        graded_accuracy=metrics_full["graded_accuracy"],
+        total=len(results_full),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Pipeline runner
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _judge_one_question(
+    *,
+    idx: int,
+    entry: dict[str, Any],
+    question_id: str,
+    api_client: httpx.AsyncClient,
+    token: str,
+    project_id: str,
+    openai_backend: LLMBackend,
+    label: str,
+) -> dict[str, Any]:
+    """Judge a single benchmark question (search R@k + retrieval judge).
+
+    Pure computation + I/O — no shared-state mutation. The caller owns
+    result recording (``results.append``), progress updates, and
+    checkpoint persistence, so concurrent workers can share this safely.
+
+    Args:
+        idx: Dataset index of the question (logging context).
+        entry: LongMemEval question entry.
+        question_id: Stable question id.
+        api_client: Authenticated HTTP client.
+        token: JWT access token.
+        project_id: Target project UUID.
+        openai_backend: LLM backend for retrieval judging.
+        label: Short label for logging (e.g. ``"full"``, ``"baseline"``).
+
+    Returns:
+        Per-question result dict with keys: ``id``, ``question``,
+        ``question_type``, ``correct``, ``reasoning``, ``judge_error``,
+        ``r1``, ``r5``, ``r10``, ``search_result_count``. ``judge_error``
+        is True when the judge LLM failed (fail-closed: ``correct`` stays
+        False); False on a genuine graded verdict.
+    """
+    question = entry.get("question", "")
+    # The LongMemEval-S dataset uses key "answer"; the oracle variant
+    # uses "expected_answer".  Try both for compatibility.
+    raw_answer = entry.get("answer", entry.get("expected_answer", ""))
+    # LongMemEval carries numeric answers as ints (32/500 in variant "s") —
+    # the judge prompt and R@k both require str.
+    expected_answer: str = "" if raw_answer is None else str(raw_answer)
+    qtype = entry.get("question_type", "unknown")
+    abstention = is_abstention(question_id)
+
+    # R@k via search + retrieval context (independent idempotent GETs,
+    # both retry internally).
+    search_results, context_text = await asyncio.gather(
+        _search(api_client, token, project_id, question, limit=10),
+        _get_context(api_client, token, project_id, question, limit=20),
+    )
+
+    r1 = compute_recall_at_k(search_results, expected_answer, k=1)
+    r5 = compute_recall_at_k(search_results, expected_answer, k=5)
+    r10 = compute_recall_at_k(search_results, expected_answer, k=10)
+
+    # The judge LLM grades the retrieved context directly against ground
+    # truth — no intermediate model answer is generated.
+    try:
+        judge_result: EvaluationResult = await evaluate_retrieval(
+            backend=openai_backend,
+            question=question,
+            expected_answer=expected_answer,
+            context_text=context_text,
+            is_abstention=abstention,
+            temperature=0.0,
+            max_tokens=512,
+        )
+        correct = judge_result.correct
+        reasoning = judge_result.reasoning
+        judge_error = False
+    except LLMStructuredOutputError as exc:
+        logger.warning(
+            "[%s] Judge LLM failed for %s: %s — marking incorrect",
+            label,
+            question_id,
+            exc,
+        )
+        correct = False
+        reasoning = f"Judge LLM error: {exc}"
+        judge_error = True
+
+    return {
+        "id": question_id,
+        "question": question,
+        "question_type": qtype,
+        "expected_answer": expected_answer,
+        "abstention": abstention,
+        "correct": correct,
+        "reasoning": reasoning,
+        "judge_error": judge_error,
+        "r1": r1,
+        "r5": r5,
+        "r10": r10,
+        "search_result_count": len(search_results),
+    }
 
 
 async def _run_benchmark_pipeline(
@@ -1162,6 +1305,7 @@ async def _run_benchmark_pipeline(
     label: str,
     checkpoint: Checkpoint,
     allow_ingest: bool,
+    workers: int = 1,
 ) -> list[dict[str, Any]]:
     """Execute a single benchmark pipeline run (resolve → query, ingest if allowed).
 
@@ -1170,11 +1314,22 @@ async def _run_benchmark_pipeline(
     non-empty projects are trusted as complete and queried directly;
     ingestion runs only when ``allow_ingest`` (``--ingest``) permits it.
 
+    The question-judge phase runs under ``asyncio.TaskGroup`` bounded by
+    a semaphore: ``workers=1`` judges strictly in dataset order
+    (sequential-equivalent); higher values shorten wall-clock only — LLM
+    cost is identical (1 call per question). Result recording
+    (append → progress → checkpoint save) is serialized under a lock so
+    the bar and the manifest never disagree. Any unexpected error
+    (anything other than a handled judge failure) propagates out of its
+    worker, cancels its siblings via the ``TaskGroup``, and aborts the
+    run loudly — the manifest keeps every completed question, so a rerun
+    resumes instead of restarting.
+
     Args:
         api_client: Authenticated HTTP client.
         token: JWT access token.
         dataset: LongMemEval question entries.
-        openai_backend: LLM backend for answer evaluation.
+        openai_backend: LLM backend for retrieval judging.
         reranker: Whether the reranker is enabled for this run.
         variant: Dataset variant (``"s"``, ``"oracle"``, etc.) — used
             to derive the persistent project name.
@@ -1183,16 +1338,20 @@ async def _run_benchmark_pipeline(
             resumed project id, the set of already-answered questions,
             and the per-question incremental persistence.
         allow_ingest: Whether ingestion is permitted (``--ingest``).
+        workers: Max questions judged concurrently (``--workers``).
 
     Returns:
         List of per-question result dicts with keys: ``id``, ``question``,
         ``question_type``, ``correct``, ``reasoning``, ``r1``, ``r5``, ``r10``,
-        ``context``, ``model_answer``.
+        ``search_result_count``.
 
     Raises:
         BenchmarkConfigError: If ingestion would be required but
-            ``allow_ingest`` is False.
+            ``allow_ingest`` is False, or ``workers`` is below 1 (a
+            zero-sized semaphore would deadlock instead of failing loud).
     """
+    if workers < 1:
+        raise BenchmarkConfigError(f"--workers must be between 1 and 32, got {workers}")
     # ── Get or create persistent project ──────────────────────────────────
     project_id, is_new = await _ensure_project(
         api_client, token, variant, checkpoint, allow_ingest
@@ -1205,40 +1364,41 @@ async def _run_benchmark_pipeline(
         # Each dataset entry gets its own session so retrieval is measured
         # across independent conversation contexts.
         ingested_count = 0
-        for idx, entry in enumerate(dataset):
-            entry_id = entry.get("question_id", f"entry_{idx}")
-            haystack = entry.get("haystack_sessions", [])
-            messages = _flatten_messages(haystack)
-            if not messages:
-                logger.warning(
-                    "[%s] Entry %s has empty messages — skipping",
-                    label,
-                    entry_id,
-                )
-                continue
+        with display.enrichment_status(f"[{label}] Ingesting conversations"):
+            for idx, entry in enumerate(dataset):
+                entry_id = entry.get("question_id", f"entry_{idx}")
+                haystack = entry.get("haystack_sessions", [])
+                messages = _flatten_messages(haystack)
+                if not messages:
+                    logger.warning(
+                        "[%s] Entry %s has empty messages — skipping",
+                        label,
+                        entry_id,
+                    )
+                    continue
 
-            # Create a session for this entry (existence guarantee —
-            # ingest below references the session by its external id).
-            session_external_id = f"longmemeval_{entry_id}"
-            await _create_session(
-                api_client,
-                token,
-                project_id,
-                external_id=session_external_id,
-            )
-
-            # LongMemEval conversations may have many messages; batch if needed
-            batch_size = 500
-            for i in range(0, len(messages), batch_size):
-                batch = messages[i : i + batch_size]
-                await _ingest_memory(
+                # Create a session for this entry (existence guarantee —
+                # ingest below references the session by its external id).
+                session_external_id = f"longmemeval_{entry_id}"
+                await _create_session(
                     api_client,
                     token,
                     project_id,
-                    batch,
-                    session_external_id=session_external_id,
+                    external_id=session_external_id,
                 )
-                ingested_count += len(batch)
+
+                # LongMemEval conversations may have many messages; batch if needed
+                batch_size = 500
+                for i in range(0, len(messages), batch_size):
+                    batch = messages[i : i + batch_size]
+                    await _ingest_memory(
+                        api_client,
+                        token,
+                        project_id,
+                        batch,
+                        session_external_id=session_external_id,
+                    )
+                    ingested_count += len(batch)
 
         logger.info(
             "[%s] Ingested %d messages across %d entries (1 session per entry)",
@@ -1249,13 +1409,14 @@ async def _run_benchmark_pipeline(
 
         # ── Wait for enrichment ────────────────────────────────────────────
         logger.info("[%s] Waiting for enrichment to complete...", label)
-        try:
-            await _wait_for_enrichment(api_client, token, project_id)
-        except TimeoutError:
-            logger.warning(
-                "[%s] Enrichment timed out — proceeding with partial data",
-                label,
-            )
+        with display.enrichment_status(f"[{label}] Waiting for enrichment"):
+            try:
+                await _wait_for_enrichment(api_client, token, project_id)
+            except TimeoutError:
+                logger.warning(
+                    "[%s] Enrichment timed out — proceeding with partial data",
+                    label,
+                )
         # Ingest phase is done (all messages sent, enrichment waited out):
         # persist immediately so a resume never mistakes this project for
         # mid-ingest partial data. Set even after a timeout — the timeout
@@ -1282,106 +1443,98 @@ async def _run_benchmark_pipeline(
     # Previously completed results lead the list so the running accuracy
     # and the saved file cover the whole run, not just this process.
     results: list[dict[str, Any]] = list(checkpoint.results)
-    for idx, entry in enumerate(dataset):
-        question = entry.get("question", "")
-        question_id = question_ids[idx]
-        # The LongMemEval-S dataset uses key "answer"; the oracle variant
-        # uses "expected_answer".  Try both for compatibility.
-        expected_answer = entry.get("answer", entry.get("expected_answer", ""))
-        qtype = entry.get("question_type", "unknown")
-        abstention = is_abstention(question_id)
+    # Resumed manifests pre-fill the bar — skipped questions never advance
+    # it, so the position always reflects judged questions.
+    progress, task_id = display.make_question_progress(len(dataset))
+    progress.update(task_id, completed=len(completed))
 
-        if question_id in completed:
-            logger.info(
-                "[%s] Skipping %s — already complete in checkpoint",
-                label,
-                question_id,
+    # Bounded worker pool: one task per unanswered question, at most
+    # ``workers`` judging concurrently. Workers only compute (pure I/O in
+    # _judge_one_question); all shared-state recording stays in the
+    # completion handler under ``state_lock``.
+    state_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(workers)
+
+    async def _run_one(idx: int, entry: dict[str, Any], question_id: str) -> None:
+        """Judge one question, then record it under the shared-state lock."""
+        async with sem:
+            result_entry = await _judge_one_question(
+                idx=idx,
+                entry=entry,
+                question_id=question_id,
+                api_client=api_client,
+                token=token,
+                project_id=project_id,
+                openai_backend=openai_backend,
+                label=label,
             )
-            continue
+            async with state_lock:
+                results.append(result_entry)
 
-        logger.info(
-            "[%s] Query %d/%d: %s",
+                # ── Real-time progress ──────────────────────────────
+                # The bar carries correct answers; failures get one red line.
+                fields = display.format_progress_fields(
+                    sum(1 for r in results if r.get("correct", False)),
+                    len(results),
+                    sum(1 for r in results if r.get("r1", False)),
+                    sum(1 for r in results if r.get("r5", False)),
+                    sum(1 for r in results if r.get("r10", False)),
+                )
+                # Same-thread coroutines only, and rich's update performs
+                # no awaits internally — safe to call under the lock.
+                progress.update(
+                    task_id,
+                    advance=1,
+                    acc=fields["acc"],
+                    r1=fields["r1"],
+                    r5=fields["r5"],
+                    r10=fields["r10"],
+                )
+                if not result_entry["correct"]:
+                    display.question_failed(question_id, result_entry["reasoning"])
+
+                # Checkpoint after EVERY question — the manifest (not the old
+                # write-only partial files) is the resume point for a rerun.
+                checkpoint.append_result(result_entry)
+                checkpoint.save()
+
+    with progress:
+        async with asyncio.TaskGroup() as tg:
+            # Invariant: with workers=1 the semaphore admits tasks in
+            # creation (dataset) order, so execution is sequential-equivalent.
+            for idx, entry in enumerate(dataset):
+                question_id = question_ids[idx]
+
+                if question_id in completed:
+                    logger.info(
+                        "[%s] Skipping %s — already complete in checkpoint",
+                        label,
+                        question_id,
+                    )
+                    continue
+
+                logger.info(
+                    "[%s] Query %d/%d: %s",
+                    label,
+                    idx + 1,
+                    len(dataset),
+                    question_id,
+                )
+                tg.create_task(_run_one(idx, entry, question_id))
+
+    # Completion order under concurrency is nondeterministic — restore
+    # canonical dataset order before saving. The manifest keeps completion
+    # order (its set-based skip resume tolerates any order — unchanged).
+    order = {qid: i for i, qid in enumerate(question_ids)}
+    unknown_ids = [r.get("id") for r in results if r.get("id") not in order]
+    if unknown_ids:
+        # Zero-fallback: an unknown result id indicates a bug — warn loudly.
+        logger.warning(
+            "[%s] %d result(s) with ids outside the dataset order: %s",
             label,
-            idx + 1,
-            len(dataset),
-            question_id,
+            len(unknown_ids),
+            unknown_ids,
         )
-
-        # R@k via search
-        search_results = await _search(
-            api_client, token, project_id, question, limit=10
-        )
-
-        r1 = compute_recall_at_k(search_results, expected_answer, k=1)
-        r5 = compute_recall_at_k(search_results, expected_answer, k=5)
-        r10 = compute_recall_at_k(search_results, expected_answer, k=10)
-
-        # End-to-end QA via context → LLM answer → judge
-        context_text = await _get_context(
-            api_client, token, project_id, question, limit=20
-        )
-
-        try:
-            model_answer = await _answer_from_context(
-                backend=openai_backend,
-                question=question,
-                context=context_text,
-                is_abstention=abstention,
-            )
-            judge_result: EvaluationResult = await evaluate_answer(
-                backend=openai_backend,
-                question=question,
-                expected_answer=expected_answer,
-                model_answer=model_answer,
-                is_abstention=abstention,
-                temperature=0.0,
-                max_tokens=512,
-            )
-            correct = judge_result.correct
-            reasoning = judge_result.reasoning
-        except LLMStructuredOutputError as exc:
-            logger.warning(
-                "[%s] Judge LLM failed for %s: %s — marking incorrect",
-                label,
-                question_id,
-                exc,
-            )
-            correct = False
-            reasoning = f"Judge LLM error: {exc}"
-            model_answer = ""
-
-        result_entry = {
-            "id": question_id,
-            "question": question,
-            "question_type": qtype,
-            "expected_answer": expected_answer,
-            "abstention": abstention,
-            "correct": correct,
-            "reasoning": reasoning,
-            "r1": r1,
-            "r5": r5,
-            "r10": r10,
-            "search_result_count": len(search_results),
-            "model_answer": model_answer,
-        }
-        results.append(result_entry)
-
-        # ── Real-time progress ──────────────────────────────────────────────
-        correct_so_far = sum(1 for r in results if r.get("correct", False))
-        total_so_far = len(results)
-        running_acc = correct_so_far / total_so_far * 100
-        print(
-            f"\n  [{idx + 1}/{len(dataset)}] {question_id}"
-            f"\n    {'✅' if correct else '❌'}  | "
-            f"R@1: {'✅' if r1 else '❌'} "
-            f"R@5: {'✅' if r5 else '❌'} "
-            f"R@10: {'✅' if r10 else '❌'}"
-            f"\n    Running: {correct_so_far}/{total_so_far} ({running_acc:.1f}%)"
-        )
-
-        # Checkpoint after EVERY question — the manifest (not the old
-        # write-only partial files) is the resume point for a rerun.
-        checkpoint.append_result(result_entry)
-        checkpoint.save()
+    results.sort(key=lambda r: order.get(str(r.get("id")), len(order)))
 
     return results

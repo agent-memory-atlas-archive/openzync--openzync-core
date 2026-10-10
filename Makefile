@@ -92,6 +92,7 @@ test-integration:
 # Options:  make benchmark ARGS="--benchmark-limit=10 --baseline --reranker"
 #           --fresh (ignore checkpoints, start over)
 #           --resume PATH (resume one explicit manifest)
+#           --workers N (judge N questions concurrently, default 1)
 benchmark:
 	.venv/bin/python -m benchmarks $(ARGS)
 

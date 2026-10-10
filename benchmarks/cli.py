@@ -26,6 +26,7 @@ import httpx
 from dotenv import load_dotenv
 
 from benchmarks.checkpoint import IN_PROGRESS_DIR, Checkpoint
+from benchmarks.longmemeval_evaluator import RETRIEVAL_JUDGE_SYSTEM_PROMPT
 from benchmarks.longmemeval_utils import DATASET_FILES, load_dataset
 from core.llm_backends import OpenAIBackend, OpenAILikeBackend
 
@@ -91,7 +92,7 @@ def parse_args(argv: Sequence[str] | None = None) -> SimpleNamespace:
     Returns:
         A ``SimpleNamespace`` with ``variant``, ``benchmark_limit``,
         ``baseline``, ``reranker``, ``resume``, ``fresh``, ``base_url``,
-        and ``ingest``.
+        ``ingest``, and ``workers``.
     """
     parser = argparse.ArgumentParser(
         prog="python -m benchmarks",
@@ -162,7 +163,19 @@ def parse_args(argv: Sequence[str] | None = None) -> SimpleNamespace:
             "ingestion would be required."
         ),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "Questions judged concurrently (default: 1). Higher values "
+            "shorten wall-clock only — LLM cost is identical "
+            "(1 call per question)."
+        ),
+    )
     parsed = parser.parse_args(argv)
+    if not 1 <= parsed.workers <= 32:
+        raise BenchmarkConfigError("--workers must be between 1 and 32")
     return SimpleNamespace(
         variant=parsed.variant,
         benchmark_limit=parsed.benchmark_limit,
@@ -172,6 +185,7 @@ def parse_args(argv: Sequence[str] | None = None) -> SimpleNamespace:
         fresh=parsed.fresh,
         base_url=parsed.base_url,
         ingest=parsed.ingest,
+        workers=parsed.workers,
     )
 
 
@@ -193,7 +207,7 @@ def require_login_creds() -> None:
 
 
 def build_llm_backend() -> LLMBackend:
-    """Create the LLM backend for answering and judging (NVIDIA-first).
+    """Create the LLM backend for retrieval judging (NVIDIA-first).
 
     ``NVIDIA_API_KEY`` configures an ``OpenAILikeBackend`` against the
     NVIDIA OpenAI-compatible endpoint; ``OPENAI_API_KEY`` configures
@@ -328,20 +342,24 @@ def build_fingerprint(
 
     A manifest is only resumed when every field matches the current run,
     so a resumed run answers exactly the same questions with the same
-    dataset, model, and configuration.
+    dataset, model, and configuration. The fingerprint includes the
+    retrieval-judge prompt hash, so old manifests holding answer-based
+    verdicts (no hash key) never match — a fresh run auto-starts instead
+    of resuming incomparable results.
 
     Args:
         variant: Dataset variant key.
         label: Run label (``"full"`` or ``"baseline"``).
         reranker: Whether the reranker is enabled for this run.
-        judge_model: Judge/answer model name.
+        judge_model: Judge model name.
         git_commit: Current git commit hash (may be ``None``).
         question_ids: Ordered question ids of the dataset subset.
         limit: ``--benchmark-limit`` value (``None`` for all questions).
 
     Returns:
         Fingerprint dict with keys ``variant``, ``label``, ``reranker``,
-        ``judge_model``, ``git_commit``, ``dataset_sha256``, and ``limit``.
+        ``judge_model``, ``git_commit``, ``dataset_sha256``,
+        ``judge_prompt_sha``, and ``limit``.
     """
     return {
         "variant": variant,
@@ -351,6 +369,9 @@ def build_fingerprint(
         "git_commit": git_commit,
         "dataset_sha256": hashlib.sha256(
             json.dumps(sorted(question_ids)).encode()
+        ).hexdigest(),
+        "judge_prompt_sha": hashlib.sha256(
+            RETRIEVAL_JUDGE_SYSTEM_PROMPT.encode()
         ).hexdigest(),
         "limit": limit,
     }

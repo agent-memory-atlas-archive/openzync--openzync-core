@@ -1,7 +1,7 @@
 """LLM-as-judge evaluation for the LongMemEval benchmark.
 
-Uses an LLM backend (e.g. OpenAI) to judge whether a model's answer
-matches the expected ground truth for each LongMemEval question.
+Uses an LLM backend (e.g. OpenAI) to judge whether the retrieved context
+contains the information needed to answer each LongMemEval question.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, Field
 
-from core.llm import PromptCachingConfig
+from core.llm import LLMStructuredOutputError, PromptCachingConfig
 
 if TYPE_CHECKING:
     from core.llm import ChatResponse, LLMBackend
@@ -56,21 +56,23 @@ class EvaluationResult(BaseModel):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-EVALUATOR_SYSTEM_PROMPT: str = (
-    "You are an expert evaluator judging the correctness of a model's answer "
-    "against a provided ground truth. Be strict but fair — minor phrasing "
-    "differences are acceptable if the meaning matches.\n\n"
+RETRIEVAL_JUDGE_SYSTEM_PROMPT: str = (
+    "You are an expert evaluator judging whether RETRIEVED CONTEXT contains "
+    "the information needed to answer a question. This is a retrieval system "
+    "under test, not a QA model — grade only the context, never a model's "
+    "answer.\n\n"
     "Guidelines:\n"
-    "- For numerical answers, exact match is required.\n"
-    "- For abstention questions, the model should clearly indicate it does not "
-    "know the answer or that the information is not available.\n"
-    '- If the ground truth is "None" or "N/A", the model should output '
-    "something semantically equivalent.\n"
-    "- Consider the answer correct if it captures the essential information "
-    "from the ground truth.\n\n"
+    "- For factual questions, correct is true iff the retrieved context "
+    "contains the ground-truth information (semantic match; minor phrasing "
+    "differences are acceptable; numerical answers require exact match). "
+    "Your reasoning MUST quote the supporting span from the context.\n"
+    "- For abstention questions, correct is true iff the retrieved context "
+    "does NOT contain the answer (the system correctly lacks the "
+    "information). If the answer is present in the context, correct is "
+    "false.\n\n"
     "Output ONLY valid JSON with the following keys:\n"
-    '- "correct": a boolean (true if the answer matches the ground truth, '
-    "false otherwise)\n"
+    '- "correct": a boolean (true if the verdict above holds, false '
+    "otherwise)\n"
     '- "reasoning": a string explaining your judgement'
 )
 
@@ -80,32 +82,37 @@ EVALUATOR_SYSTEM_PROMPT: str = (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def evaluate_answer(
+async def evaluate_retrieval(
     backend: LLMBackend,
     question: str,
     expected_answer: str,
-    model_answer: str,
+    context_text: str,
     is_abstention: bool,
     temperature: float = 0.0,
     **kwargs: Any,
 ) -> EvaluationResult:
-    """Evaluate whether a model's answer matches the expected ground truth.
+    """Evaluate whether retrieved context contains the ground-truth answer.
 
-    Uses the provided LLM backend as a judge, asking it to compare the model's
-    answer against the ground truth for a LongMemEval question.
+    Uses the provided LLM backend as a judge, asking it to decide whether
+    the retrieved context holds the information needed to answer a
+    LongMemEval question. The judge grades the retrieval directly — no
+    intermediate model answer is generated.
 
-    The judge is instructed to be strict but fair — minor phrasing differences
-    are acceptable if the meaning matches, but numerical answers require exact
-    match. For abstention questions, the model should indicate it does not know.
+    For factual questions the context is correct iff it contains the
+    ground-truth information (semantic match; minor phrasing differences
+    are acceptable, but numerical answers require exact match). For
+    abstention questions the context is correct iff it does NOT contain
+    the answer (the system correctly lacks the information).
 
     Args:
         backend: An initialised LLM backend instance to use as the judge.
         question: The LongMemEval question text.
         expected_answer: The ground-truth answer from the benchmark dataset.
-        model_answer: The answer produced by the model under evaluation.
-        is_abstention: Whether this question expects the model to abstain
-            (i.e. indicate it does not know the answer or the information is
-            not available).
+        context_text: The retrieved context text assembled for the question.
+        is_abstention: Whether this question expects abstention. When True,
+            ``correct`` is True iff ``context_text`` does NOT contain the
+            answer; when False, ``correct`` is True iff ``context_text``
+            DOES contain the ground-truth information.
         temperature: LLM sampling temperature for the judge. Defaults to 0.0
             for deterministic, reproducible evaluation.
         **kwargs: Additional keyword arguments forwarded to ``backend.chat()``
@@ -118,7 +125,8 @@ async def evaluate_answer(
     Raises:
         LLMStructuredOutputError: If the judge's response cannot be parsed
             into an ``EvaluationResult`` after exhausting validation retries
-            inside the backend's ``chat()`` method.
+            inside the backend's ``chat()`` method, or if the judge
+            returned no parseable content at all.
     """
     question_type: str = "abstention" if is_abstention else "factual"
 
@@ -126,13 +134,14 @@ async def evaluate_answer(
         f"Question type: {question_type}\n\n"
         f"Question: {question}\n\n"
         f"Expected answer (ground truth): {expected_answer}\n\n"
-        f"Model's answer: {model_answer}\n\n"
-        "Evaluate the model's answer against the ground truth. "
+        f"Retrieved context: {context_text}\n\n"
+        "Decide whether the retrieved context contains the information needed "
+        "to answer the question. "
         "Output ONLY valid JSON with 'correct' (bool) and 'reasoning' (string) keys."
     )
 
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": EVALUATOR_SYSTEM_PROMPT},
+        {"role": "system", "content": RETRIEVAL_JUDGE_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -175,7 +184,8 @@ async def evaluate_answer(
                 },
             )
 
-    # No usable content from the judge — return a safe default.
+    # No usable content from the judge — fail loudly so the caller can
+    # mark this entry as judge infra failure rather than a retrieval miss.
     logger.error(
         "evaluator.no_valid_result",
         extra={
@@ -184,7 +194,4 @@ async def evaluate_answer(
             "model": response.model,
         },
     )
-    return EvaluationResult(
-        correct=False,
-        reasoning=("Judge LLM returned no parseable result. Defaulting to incorrect."),
-    )
+    raise LLMStructuredOutputError("Judge LLM returned no parseable result.")

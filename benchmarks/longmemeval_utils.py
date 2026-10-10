@@ -283,18 +283,31 @@ def compute_accuracy(results: list[dict[str, Any]]) -> dict[str, Any]:
 
     Args:
         results: List of result dicts.  Each must contain ``question_type``
-            (``str``) and ``correct`` (``bool``) keys.
+            (``str``) and ``correct`` (``bool``) keys. Entries may carry
+            ``judge_error`` (``bool``); missing keys count as graded.
 
     Returns:
         A dict with:
 
-        - ``overall_accuracy``: float — total correct divided by total.
+        - ``overall_accuracy``: float — total correct divided by total
+          (judge-error entries stay incorrect in the headline).
+        - ``judge_errors``: int — entries with ``judge_error`` set.
+        - ``graded_accuracy``: float — correct among non-error entries
+          (0.0 when every entry is a judge error).
         - ``per_category``: dict mapping each category name to
-          ``{"correct": int, "total": int, "accuracy": float}``.
+          ``{"correct": int, "total": int, "accuracy": float}``
+          (judge-error entries stay incorrect in categories).
     """
     per_category: dict[str, dict[str, int]] = {}
     total_correct = 0
     total_count = len(results)
+    judge_errors = sum(1 for r in results if bool(r.get("judge_error", False)))
+    graded_total = total_count - judge_errors
+    graded_correct = sum(
+        1
+        for r in results
+        if not bool(r.get("judge_error", False)) and bool(r.get("correct", False))
+    )
 
     for r in results:
         qtype = get_question_type_category(r.get("question_type", ""))
@@ -310,6 +323,10 @@ def compute_accuracy(results: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "overall_accuracy": (
             round(total_correct / total_count, 4) if total_count > 0 else 0.0
+        ),
+        "judge_errors": judge_errors,
+        "graded_accuracy": (
+            round(graded_correct / graded_total, 4) if graded_total > 0 else 0.0
         ),
         "per_category": {
             cat: {
